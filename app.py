@@ -52,12 +52,17 @@ def load_and_prep_data():
         
         # VECTORIZED CALCULATION: Replaces the slow lambda function, speeding up aggregation dramatically
         df['Missed_Line_Flag'] = (df['Missed_Qty'] > 0).astype(int)
+
+        # Ordered value (RWF). Older databases don't have it yet -> it stays empty until the Excel is re-uploaded once.
+        if 'Ordered_Value' not in df.columns:
+            df['Ordered_Value'] = float('nan')
         
         df_agg = df.groupby(['Month', 'Week_Start', 'Week Range', 'Date', 'Sales Document Type', 'Branch', 'Material Description'], dropna=False, as_index=False).agg(
             Order_Qty=('Order_Qty', 'sum'),
             Confirmed_Qty=('Confirmed_Qty', 'sum'),
             Missed_Qty=('Missed_Qty', 'sum'),
             Lost_Value=('Lost_Value', 'sum'),
+            Ordered_Value=('Ordered_Value', 'sum'),
             Total_Lines=('Sales Document', 'count'),
             Missed_Lines=('Missed_Line_Flag', 'sum')
         ).rename(columns={
@@ -73,6 +78,17 @@ def load_and_prep_data():
 
 # Call the cached data loader
 df, db_stats, json_data = load_and_prep_data()
+
+# --- Extras for the added value-perspective cards, charts and tables (additive; nothing above is changed) ---
+LARGE_THRESHOLD = 25000000   # RWF missed per single order item that counts as a "large order" to verify
+ORDVAL_READY = bool((not df.empty) and ('Ordered_Value' in df.columns) and df['Ordered_Value'].notna().all())
+ORDVAL_READY_JS = 'true' if ORDVAL_READY else 'false'
+if not df.empty:
+    _large = df[df['Lost_Value'] >= LARGE_THRESHOLD][['Sales Document', 'Sales Document Item', 'Date', 'Month', 'Sales Document Type', 'Branch', 'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value']].rename(columns={
+        'Sales Document': 'Doc', 'Sales Document Item': 'Item', 'Sales Document Type': 'Sales_Doc_Type', 'Material Description': 'Product_Desc'})
+    large_json = _large.fillna(0).to_json(orient='records')
+else:
+    large_json = "[]"
 
 # ---------------------------------------------------------------------
 # 3. EXACT HTML DASHBOARD INJECTION
@@ -190,6 +206,96 @@ html_template = f"""
         .dataTables_filter {{ float: right; margin-bottom: 10px; }}
         .dt-btn {{ background-color: transparent !important; border: 1px solid var(--accent-purple) !important; color: var(--accent-purple) !important; border-radius: 4px !important; padding: 4px 8px !important; font-size: 0.75rem !important; font-weight: 600 !important; cursor: pointer; margin-right: 5px; }}
         .dt-btn:hover {{ background-color: var(--accent-purple) !important; color: white !important; }}
+
+        /* ---- Added: value perspective, made-vs-missed charts & extra tables (same look & feel) ---- */
+        .section-label {{ font-size: 0.7rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; margin: 2px 0 -6px 2px; }}
+        .howto-box {{ background: #fffbeb; border: 1px solid #fde68a; border-left: 5px solid #f59e0b; border-radius: var(--border-radius); padding: 10px 15px; font-size: 0.78rem; line-height: 1.55; color: #4b5563; }}
+        .howto-box b {{ color: var(--text-main); }}
+        .kpi-value.kpi-value-sm {{ font-size: 1.9rem; }}
+
+
+        /* ---- Added: 6-card KPI rows, donuts, fulfilment cards, branch drill-down ---- */
+        .kpi-row {{ grid-template-columns: repeat(6, 1fr); }}
+        .kpi-row .kpi-title {{ font-size: 0.64rem; letter-spacing: 0.3px; padding-right: 22px; line-height: 1.25; }}
+        @media (min-width: 1850px) {{ .kpi-row .kpi-title {{ font-size: 0.7rem; letter-spacing: 0.5px; }} }}
+        .card-green {{ background: linear-gradient(135deg, #d1fae5 0%, #86efac 100%); border: none; }}
+        .card-green .kpi-title {{ color: #166534; }} .card-green .kpi-value {{ color: #14532d; }}
+
+        @media (max-width: 1849px) {{ #donutChartContainer, #valRateDonutContainer {{ height: 54px !important; }} #donutChart, #valRateDonut {{ width: 52px !important; height: 52px !important; }} #kpiRateText, #kpiRateVal {{ font-size: 0.9rem !important; }} }}
+
+        /* value-rate donut (same behaviour as the Missed Rate donut) */
+        #valRateDonutContainer {{ transition: opacity 0.3s ease-in; }}
+        .flip-card:hover #valRateDonutContainer {{ opacity: 0 !important; transition: opacity 0.1s ease-out; }}
+
+        /* items-short donut */
+        #itemsDonutContainer {{ position: absolute; right: 12px; top: 28px; width: 52px; height: 52px; display: flex; align-items: center; justify-content: center; transition: opacity 0.3s ease-in; }}
+        .flip-card:hover #itemsDonutContainer {{ opacity: 0 !important; transition: opacity 0.1s ease-out; }}
+        #itemsRateText {{ position: absolute; font-size: 0.72rem; font-weight: 800; color: #78350f; z-index: 2; }}
+        #itemsDonut {{ width: 52px; height: 52px; position: absolute; z-index: 1; }}
+        #kpiItems {{ font-size: 1.8rem; }}
+        #kpiItemsSub {{ white-space: nowrap; }}
+        .items-full {{ display: none; }}
+        @media (min-width: 1850px) {{ #itemsDonutContainer, #itemsDonut {{ width: 58px; height: 58px; }} #itemsRateText {{ font-size: 0.85rem; }} #kpiItems {{ font-size: 2rem; }} .items-full {{ display: inline; }} }}
+        @media (max-width: 1299px) {{ #itemsDonutContainer, #itemsDonut {{ width: 48px; height: 48px; }} #itemsRateText {{ font-size: 0.64rem; }} #kpiItems {{ font-size: 1.5rem; }} .items-word {{ display: none; }} }}
+        @media (max-width: 1150px) {{ .kpi-row {{ grid-template-columns: repeat(3, 1fr); }} #donutChartContainer, #valRateDonutContainer {{ height: 60px !important; }} #donutChart, #valRateDonut {{ width: 58px !important; height: 58px !important; }} #kpiRateText, #kpiRateVal {{ font-size: 1.05rem !important; }} #itemsDonutContainer, #itemsDonut {{ width: 52px; height: 52px; }} #itemsDonutContainer {{ right: 12px; }} #itemsRateText {{ font-size: 0.72rem; }} #kpiItems {{ font-size: 1.8rem; }} }}
+
+        /* figures scale with the card width, so they never overflow at any window size or browser zoom */
+        .flip-card {{ container-type: inline-size; }}
+        @supports (font-size: 1cqw) {{
+            .kpi-row .kpi-value {{ font-size: clamp(1.05rem, 16cqw, 2rem); }}
+            #kpiItems {{ font-size: clamp(1rem, 13cqw, 2rem); }}
+            #itemsDonutContainer, #itemsDonut {{ width: clamp(36px, 24cqw, 58px); height: clamp(36px, 24cqw, 58px); }}
+            #itemsRateText {{ font-size: clamp(0.55rem, 5cqw, 0.85rem); }}
+            #valRateDonutContainer, #donutChartContainer {{ height: clamp(44px, 26cqw, 60px) !important; }}
+            #valRateDonut, #donutChart {{ width: clamp(44px, 26cqw, 60px) !important; height: clamp(44px, 26cqw, 60px) !important; }}
+            #kpiRateVal, #kpiRateText {{ font-size: clamp(0.72rem, 6.4cqw, 1.05rem) !important; }}
+            @container (min-width: 190px) {{ .items-word {{ display: inline; }} }}
+            @container (min-width: 250px) {{ .items-full {{ display: inline; }} }}
+        }}
+
+
+        /* icons stay perfectly round; cards a little shorter so they look more rectangular */
+        .kpi-row .kpi-header .info-icon {{ flex: 0 0 18px; width: 18px; height: 18px; min-width: 18px; aspect-ratio: 1 / 1; }}
+        .kpi-row .flip-card {{ height: 100px; }}
+        .kpi-row .flip-card-front, .kpi-row .flip-card-back {{ padding: 10px 14px; }}
+        .kpi-row .kpi-value {{ margin-top: 2px; }}
+        .kpi-row .badge-row {{ margin-top: 6px; }}
+        .kpi-row .kpi-formula {{ margin-top: 6px; padding: 4px 6px; font-size: clamp(0.56rem, 5.4cqw, 0.7rem); }}
+        .kpi-row .flip-card-back .kpi-title-back {{ font-size: 0.68rem; }}
+        @media (min-width: 1700px) {{ .kpi-row .flip-card {{ height: 106px; }} }}
+        .kpi-hint {{ font-size: 0.54rem; margin-top: 4px; color: #4b5563; font-weight: 600; }}
+        .card-clickable {{ cursor: pointer; }}
+        .card-clickable:focus {{ outline: none; }}
+        .card-clickable:focus-visible .flip-card-front {{ box-shadow: 0 0 0 2px #7c3aed; }}
+        .lg-arrow {{ display: none; }}
+        @supports (font-size: 1cqw) {{ @container (min-width: 170px) {{ .lg-arrow {{ display: inline; }} }} }}
+        .badge-purple {{ background: #4c1d95; color: #f3e8ff; border: 1px solid #7c3aed; white-space: nowrap; }}
+        @media (max-width: 780px) {{ .kpi-row {{ grid-template-columns: repeat(2, 1fr); }} }}
+
+        /* click-to-drill on the branch bar charts */
+        .drill-hint {{ font-size: 0.68rem; font-weight: 500; color: var(--text-muted); margin-left: 8px; }}
+        #branchValueChart .nsewdrag, #branchQtyChart .nsewdrag, #madeMissValChart .nsewdrag, #madeMissQtyChart .nsewdrag {{ cursor: pointer !important; }}
+        #drillOverlay {{ display: none; position: absolute; left: 0; top: 0; width: 100%; z-index: 1000; background: rgba(43, 54, 72, 0.45); }}
+        #drillBox {{ position: absolute; left: 50%; transform: translateX(-50%); width: min(1040px, 94%); background: var(--bg-color); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.3); padding: 0 0 16px 0; overflow: hidden; }}
+        .drill-head {{ background-image: linear-gradient(to right, #4c4eb8, #5a5ce0); color: #fff; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; }}
+        #drillTitle {{ font-size: 1.15rem; font-weight: 800; }} #drillSub {{ font-size: 0.72rem; opacity: 0.85; margin-top: 2px; }}
+        #drillBox:focus {{ outline: none; }}
+        #drillClose {{ background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.4); color: #fff; width: 32px; height: 32px; border-radius: 6px; font-size: 1.2rem; cursor: pointer; line-height: 1; }}
+        #drillClose:hover {{ background: rgba(255,255,255,0.32); }}
+        #drillBody {{ padding: 14px 18px 0 18px; display: flex; flex-direction: column; gap: 14px; }}
+        .drill-tiles {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }}
+        .drill-tile {{ background: #fff; border: 1px solid var(--border-color); border-radius: 10px; padding: 10px 12px; box-shadow: var(--shadow); }}
+        .drill-tile .t-label {{ font-size: 0.65rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; }}
+        .drill-tile .t-value {{ font-size: 1.45rem; font-weight: 800; margin-top: 3px; color: var(--text-main); }}
+        .drill-tile .t-ord {{ color: #1e3a8a; }} .drill-tile .t-made {{ color: #059669; }} .drill-tile .t-miss {{ color: #e0623f; }}
+        .drill-strip {{ background: #fff; border-left: 5px solid var(--accent-purple); border-radius: 10px; padding: 10px 14px; font-size: 0.82rem; color: var(--text-main); line-height: 1.6; box-shadow: var(--shadow); }}
+        .drill-grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+        .drill-panel {{ background: #fff; border: 1px solid var(--border-color); border-radius: 10px; padding: 12px; box-shadow: var(--shadow); }}
+        .drill-panel h4 {{ margin: 0 0 8px 0; font-size: 0.9rem; font-weight: 600; color: var(--text-main); }}
+        .drill-panel .table-container {{ max-height: 330px; }}
+        .drill-panel td.num, .drill-panel th.num {{ text-align: right; }}
+        .drill-panel .light-table th, .drill-panel .light-table td {{ padding: 8px 6px; font-size: 0.76rem; }}
+        .drill-panel .light-table td:nth-child(5) {{ white-space: normal; }}
     </style>
 </head>
 <body>
@@ -237,24 +343,35 @@ html_template = f"""
         <!-- MAIN CONTENT DASHBOARD -->
         <div class="main-content">
             <!-- TOP ROW -->
+            <!-- VALUE PERSPECTIVE (first line) -->
+            <div class="section-label">Value perspective (RWF)</div>
             <div class="kpi-row">
                 <div class="flip-card">
-                    <div class="flip-card-inner" id="card1-inner">
-                        <div class="flip-card-front card-purple">
-                            <div class="kpi-header"><span class="kpi-title">MISSED RATE</span><span class="info-icon">i</span></div>
-                            <!-- FIXED PIE CHART OVERLAY (Reduced Font & Handled Flip) -->
-                            <div id="donutChartContainer" style="display:flex; align-items:center; justify-content: center; height: 75px; width: 100%; padding-top: 5px; position:relative;">
-                                <div id="kpiRateText" style="position: absolute; font-size: 1.05rem; font-weight: 800; color: #4c1d95; z-index: 2;">0%</div>
-                                <div id="donutChart" style="width: 80px; height: 80px; position: absolute; z-index: 1;"></div>
-                            </div>
+                    <div class="flip-card-inner" id="card6-inner">
+                        <div class="flip-card-front card-blue">
+                            <div class="kpi-header"><span class="kpi-title">TOTAL SALES ORDERED</span><span class="info-icon">i</span></div>
+                            <div class="kpi-value" id="kpiOrdVal">0</div>
+                            
                         </div>
                         <div class="flip-card-back">
-                            <div class="kpi-header"><span class="kpi-title-back">MISSED RATE FORMULA</span></div>
-                            <div class="kpi-formula">(Total Missed Vol / Total Ordered Vol) * 100</div>
+                            <div class="kpi-header"><span class="kpi-title-back">ORDERED VALUE FORMULA</span></div>
+                            <div class="kpi-formula">Sum(Order Qty x Net Price)</div>
                         </div>
                     </div>
                 </div>
-
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card7-inner">
+                        <div class="flip-card-front card-teal">
+                            <div class="kpi-header"><span class="kpi-title">SALES MADE</span><span class="info-icon">i</span></div>
+                            <div class="kpi-value" id="kpiMadeVal">0</div>
+                            <div class="badge-row"><span class="badge badge-teal">Confirmed Value</span></div>
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">SALES MADE FORMULA</span></div>
+                            <div class="kpi-formula">Ordered Value - Missed Value</div>
+                        </div>
+                    </div>
+                </div>
                 <div class="flip-card">
                     <div class="flip-card-inner" id="card2-inner">
                         <div class="flip-card-front card-yellow">
@@ -267,7 +384,53 @@ html_template = f"""
                         </div>
                     </div>
                 </div>
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card8-inner">
+                        <div class="flip-card-front card-red">
+                            <div class="kpi-header"><span class="kpi-title">MISSED RATE (VALUE)</span><span class="info-icon">i</span></div>
+                            <div id="valRateDonutContainer" style="display:flex; align-items:center; justify-content: center; height: 75px; width: 100%; padding-top: 5px; position:relative;">
+                                <div id="kpiRateVal" style="position: absolute; font-size: 1.05rem; font-weight: 800; color: #7f1d1d; z-index: 2;">0%</div>
+                                <div id="valRateDonut" style="width: 80px; height: 80px; position: absolute; z-index: 1;"></div>
+                            </div>
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">VALUE RATE FORMULA</span></div>
+                            <div class="kpi-formula">(Missed Value / Ordered Value) * 100</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card9-inner">
+                        <div class="flip-card-front card-green">
+                            <div class="kpi-header"><span class="kpi-title">FULFILMENT RATE (VALUE)</span><span class="info-icon">i</span></div>
+                            <div class="kpi-value" id="kpiFulfVal">0</div>
+                            
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">FULFILMENT FORMULA</span></div>
+                            <div class="kpi-formula">(Sales Made / Ordered Value) * 100</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flip-card card-clickable" id="largeCard" role="button" tabindex="0" title="Click to see the large orders">
+                    <div class="flip-card-inner" id="card11-inner">
+                        <div class="flip-card-front card-purple">
+                            <div class="kpi-header"><span class="kpi-title">LARGE ORDERS SHARE</span><span class="info-icon">i</span></div>
+                            <div class="kpi-value" id="kpiLargeShare">0</div>
+                            <div class="badge-row"><span class="badge badge-purple" id="kpiLargeSub">-</span></div>
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">LARGE ORDERS</span></div>
+                            <div class="kpi-formula" id="kpiLargeFormula">Missed of large items / Total missed</div>
+                            <div class="kpi-hint">Click for the list</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
 
+            <!-- QUANTITY PERSPECTIVE (second line) -->
+            <div class="section-label">Quantity perspective (units)</div>
+            <div class="kpi-row">
                 <div class="flip-card">
                     <div class="flip-card-inner" id="card3-inner">
                         <div class="flip-card-front card-blue">
@@ -280,7 +443,6 @@ html_template = f"""
                         </div>
                     </div>
                 </div>
-
                 <div class="flip-card">
                     <div class="flip-card-inner" id="card4-inner">
                         <div class="flip-card-front card-teal">
@@ -294,7 +456,6 @@ html_template = f"""
                         </div>
                     </div>
                 </div>
-
                 <div class="flip-card">
                     <div class="flip-card-inner" id="card5-inner">
                         <div class="flip-card-front card-red">
@@ -305,6 +466,49 @@ html_template = f"""
                         <div class="flip-card-back">
                             <div class="kpi-header"><span class="kpi-title-back">MISSED FORMULA</span></div>
                             <div class="kpi-formula">Ord Qty - Del Qty</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card1-inner">
+                        <div class="flip-card-front card-purple">
+                            <div class="kpi-header"><span class="kpi-title">MISSED RATE (QTY)</span><span class="info-icon">i</span></div>
+                            <!-- FIXED PIE CHART OVERLAY (Reduced Font & Handled Flip) -->
+                            <div id="donutChartContainer" style="display:flex; align-items:center; justify-content: center; height: 75px; width: 100%; padding-top: 5px; position:relative;">
+                                <div id="kpiRateText" style="position: absolute; font-size: 1.05rem; font-weight: 800; color: #4c1d95; z-index: 2;">0%</div>
+                                <div id="donutChart" style="width: 80px; height: 80px; position: absolute; z-index: 1;"></div>
+                            </div>
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">MISSED RATE FORMULA</span></div>
+                            <div class="kpi-formula">(Total Missed Vol / Total Ordered Vol) * 100</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card12-inner">
+                        <div class="flip-card-front card-green">
+                            <div class="kpi-header"><span class="kpi-title">FULFILMENT RATE (QTY)</span><span class="info-icon">i</span></div>
+                            <div class="kpi-value" id="kpiFulfQty">0</div>
+                            
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">FULFILMENT FORMULA</span></div>
+                            <div class="kpi-formula">((Ordered Qty - Missed Qty) / Ordered Qty) * 100</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flip-card">
+                    <div class="flip-card-inner" id="card10-inner">
+                        <div class="flip-card-front card-yellow">
+                            <div class="kpi-header"><span class="kpi-title">ORDER ITEMS SHORT</span><span class="info-icon">i</span></div>
+                            <div id="itemsDonutContainer"><div id="itemsRateText">0%</div><div id="itemsDonut"></div></div>
+                            <div class="kpi-value" id="kpiItems">0</div>
+                            <div class="badge-row"><span class="badge badge-red" id="kpiItemsSub">-</span></div>
+                        </div>
+                        <div class="flip-card-back">
+                            <div class="kpi-header"><span class="kpi-title-back">ITEMS SHORT FORMULA</span></div>
+                            <div class="kpi-formula">(Items with Missed Qty > 0 / Total items) * 100</div>
                         </div>
                     </div>
                 </div>
@@ -319,6 +523,14 @@ html_template = f"""
                 </ul>
             </div>
             
+            <!-- ADDED: HOW TO READ -->
+            <div class="howto-box">
+                <b>How to read:</b> <b>Ordered</b> = what customers asked for. <b>Made</b> = ordered minus missed (confirmed). <b>Missed</b> = ordered but not confirmed (mostly no stock).
+                <b>Missed rate</b> = missed &divide; ordered of the <i>same</i> branch or month (its own failure rate). <b>Share of all missed</b> = that branch's missed &divide; missed of <i>all</i> branches.
+                Value rates (RWF) and unit rates differ because the missed items are often expensive. <b>Large orders share</b> = part of the missed value that comes from single items of RWF {LARGE_THRESHOLD // 1000000}M+ (click that card to list them).
+                <span id="ordValNote" style="color:#b45309; font-weight:600;"></span>
+            </div>
+
             <!-- BAR CHARTS ROW -->
             <div class="grid-row-middle">
                 <div class="panel">
@@ -340,6 +552,30 @@ html_template = f"""
                 <div class="panel">
                     <div class="panel-header">Lost Value by Doc Type <span class="info-icon">i</span></div>
                     <div class="chart-container" id="docTypeChart"></div>
+                </div>
+            </div>
+
+            <!-- ADDED: MADE vs MISSED BY BRANCH -->
+            <div class="grid-row-middle">
+                <div class="panel">
+                    <div class="panel-header">Value: Made vs Missed by Branch (% of own orders) <span class="info-icon">i</span></div>
+                    <div class="chart-container" id="madeMissValChart"></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-header">Units: Made vs Missed by Branch (% of own orders) <span class="info-icon">i</span></div>
+                    <div class="chart-container" id="madeMissQtyChart"></div>
+                </div>
+            </div>
+
+            <!-- ADDED: MONTHLY MADE vs MISSED -->
+            <div class="grid-row-middle">
+                <div class="panel">
+                    <div class="panel-header">Sales Made vs Missed by Month (RWF) <span class="info-icon">i</span></div>
+                    <div class="chart-container" id="monthValueChart"></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-header">Missed Rate by Month: Value % vs Units % <span class="info-icon">i</span></div>
+                    <div class="chart-container" id="monthRateChart"></div>
                 </div>
             </div>
         </div>
@@ -369,6 +605,38 @@ html_template = f"""
         </div>
     </div>
 
+    <!-- ADDED: BRANCH PERFORMANCE / MONTHLY SUMMARY / LARGE ORDERS -->
+    <div class="panel" style="margin-top: 15px;">
+        <div class="panel-header">Branch Performance: Ordered vs Made vs Missed</div>
+        <div class="table-container">
+            <table class="light-table display nowrap" id="branchPerfTable" style="width:100%">
+                <thead>
+                    <tr><th>Branch</th><th>Sales Ordered (RWF)</th><th>Sales Made (RWF)</th><th>Sales Missed (RWF)</th><th>Missed % (Value)</th><th>Share of All Missed</th><th>Units Ordered</th><th>Units Made</th><th>Units Missed</th><th>Missed % (Units)</th></tr>
+                </thead>
+            </table>
+        </div>
+    </div>
+    <div class="panel" style="margin-top: 15px;">
+        <div class="panel-header">Monthly Summary</div>
+        <div class="table-container">
+            <table class="light-table display nowrap" id="monthSummaryTable" style="width:100%">
+                <thead>
+                    <tr><th>Month</th><th>Sales Ordered (RWF)</th><th>Sales Made (RWF)</th><th>Sales Missed (RWF)</th><th>Missed % (Value)</th><th>Units Ordered</th><th>Units Made</th><th>Units Missed</th><th>Missed % (Units)</th><th>Share of Missed Value</th></tr>
+                </thead>
+            </table>
+        </div>
+    </div>
+    <div class="panel" style="margin-top: 15px;">
+        <div class="panel-header">Large Orders to Verify (single items with RWF 25M+ missed)</div>
+        <div class="table-container">
+            <table class="light-table display nowrap" id="largeTable" style="width:100%">
+                <thead>
+                    <tr><th>Sales Doc</th><th>Item</th><th>Doc Date</th><th>Branch</th><th>Product</th><th>Ord Qty</th><th>Del Qty</th><th>Miss Qty</th><th>Lost Value (RWF)</th></tr>
+                </thead>
+            </table>
+        </div>
+    </div>
+
     <div class="panel" style="margin-top: 15px;">
         <div class="panel-header">Unfulfilled Details Log</div>
         <div class="table-container">
@@ -384,10 +652,25 @@ html_template = f"""
         </div>
     </div>
 
+    <!-- ADDED: BRANCH DRILL-DOWN (opens when a branch bar is clicked) -->
+    <div id="drillOverlay">
+        <div id="drillBox">
+            <div class="drill-head">
+                <div><div id="drillTitle"></div><div id="drillSub"></div></div>
+                <button id="drillClose" title="Close (Esc)">&times;</button>
+            </div>
+            <div id="drillBody"></div>
+        </div>
+    </div>
+
     <!-- JAVASCRIPT: INSTANT FILTERING & RENDERING -->
     <script>
         const rawData = {json_data};
         let tableDetails, tableLoc, tableItems;
+        const largeData = {large_json};
+        const ordValReady = {ORDVAL_READY_JS};
+        const LARGE_T = {LARGE_THRESHOLD};
+        let tableBranchPerf, tableMonthSum, tableLarge;
 
         const btnConfig = [
             {{ extend: 'excelHtml5', text: '📥 Excel', className: 'dt-btn' }},
@@ -419,8 +702,8 @@ html_template = f"""
                 columns: [
                     {{data: 'Month'}}, {{data: 'Date'}}, {{data: 'Sales_Doc_Type'}}, 
                     {{data: 'Branch'}}, {{data: 'Product_Desc'}}, {{data: 'Week_Range'}},
-                    {{data: 'Order_Qty'}}, {{data: 'Confirmed_Qty'}}, 
-                    {{data: 'Missed_Qty', render: function(data){{ return `<span style="color:#f48a6a; font-weight:bold;">${{data}}</span>`; }}}},
+                    {{data: 'Order_Qty', render: function(d) {{ return (d === null || d === undefined || d === '') ? '' : Number(d).toLocaleString('en-US', {{maximumFractionDigits: 3}}); }}}}, {{data: 'Confirmed_Qty', render: function(d) {{ return (d === null || d === undefined || d === '') ? '' : Number(d).toLocaleString('en-US', {{maximumFractionDigits: 3}}); }}}}, 
+                    {{data: 'Missed_Qty', render: function(data){{ return `<span style="color:#f48a6a; font-weight:bold;">${{Number(data).toLocaleString('en-US', {{maximumFractionDigits: 3}})}}</span>`; }}}},
                     {{data: 'Lost_Value', render: $.fn.dataTable.render.number(',', '.', 0)}}
                 ],
                 order: [[9, 'desc']], paging: false, scrollY: "400px", scrollCollapse: true, info: false, deferRender: true
@@ -429,7 +712,7 @@ html_template = f"""
             tableLoc = $('#locationTable').DataTable({{
                 dom: 'Brtip', buttons: btnConfig,
                 columns: [
-                    {{data: 'Branch'}}, {{data: 'Products'}},
+                    {{data: 'Branch'}}, {{data: 'Products', render: function(d) {{ return (d === null || d === undefined || d === '') ? '' : Number(d).toLocaleString('en-US', {{maximumFractionDigits: 3}}); }}}},
                     {{data: 'Lost', render: $.fn.dataTable.render.number(',', '.', 0)}},
                     {{data: 'Pct', render: function(d){{ return d + '%'; }}}}
                 ],
@@ -439,11 +722,35 @@ html_template = f"""
             tableItems = $('#topItemsTable').DataTable({{
                 dom: 'Brtip', buttons: btnConfig,
                 columns: [
-                    {{data: 'Product'}}, {{data: 'Lines'}},
+                    {{data: 'Product'}}, {{data: 'Lines', render: function(d) {{ return (d === null || d === undefined || d === '') ? '' : Number(d).toLocaleString('en-US', {{maximumFractionDigits: 3}}); }}}},
                     {{data: 'Lost', render: $.fn.dataTable.render.number(',', '.', 0)}}
                 ],
                 order: [[2, 'desc']], paging: false, scrollY: "300px", scrollCollapse: true, info: false, bFilter: false
             }});
+
+            // ADDED: init of the extra tables (guarded so the original tables are never affected)
+            try {{
+                const numR = function(d) {{ return (d === null || d === undefined) ? '&mdash;' : Number(d).toLocaleString('en-US', {{maximumFractionDigits: 0}}); }};
+                const pctR = function(d) {{ return (d === null || d === undefined) ? '&mdash;' : Number(d).toFixed(1) + '%'; }};
+                tableBranchPerf = $('#branchPerfTable').DataTable({{
+                    dom: 'Brtip', buttons: btnConfig,
+                    columns: [ {{data: 'Branch'}}, {{data: 'OrdVal', render: numR}}, {{data: 'MadeVal', render: numR}}, {{data: 'MissVal', render: numR}}, {{data: 'RateVal', render: pctR}}, {{data: 'Share', render: pctR}},
+                               {{data: 'OrdQty', render: numR}}, {{data: 'MadeQty', render: numR}}, {{data: 'MissQty', render: numR}}, {{data: 'RateQty', render: pctR}} ],
+                    order: [[3, 'desc']], paging: false, scrollY: "320px", scrollCollapse: true, info: false, bFilter: false
+                }});
+                tableMonthSum = $('#monthSummaryTable').DataTable({{
+                    dom: 'Brtip', buttons: btnConfig,
+                    columns: [ {{data: 'Month'}}, {{data: 'OrdVal', render: numR}}, {{data: 'MadeVal', render: numR}}, {{data: 'MissVal', render: numR}}, {{data: 'RateVal', render: pctR}},
+                               {{data: 'OrdQty', render: numR}}, {{data: 'MadeQty', render: numR}}, {{data: 'MissQty', render: numR}}, {{data: 'RateQty', render: pctR}}, {{data: 'Share', render: pctR}} ],
+                    ordering: false, paging: false, info: false, bFilter: false
+                }});
+                tableLarge = $('#largeTable').DataTable({{
+                    dom: 'Brtip', buttons: btnConfig,
+                    columns: [ {{data: 'Doc'}}, {{data: 'Item'}}, {{data: 'Date'}}, {{data: 'Branch'}}, {{data: 'Product_Desc'}}, {{data: 'Order_Qty', render: numR}}, {{data: 'Confirmed_Qty', render: numR}},
+                               {{data: 'Missed_Qty', render: function(d){{ return '<span style="color:#f48a6a; font-weight:bold;">' + numR(d) + '</span>'; }}}}, {{data: 'Lost_Value', render: numR}} ],
+                    order: [[8, 'desc']], paging: false, scrollY: "300px", scrollCollapse: true, info: false, bFilter: false
+                }});
+            }} catch (e) {{ console.error('Extra tables init error:', e); }}
 
             // Listeners
             document.getElementById('filterMonth').addEventListener('change', updateDashboard);
@@ -583,13 +890,391 @@ html_template = f"""
             document.getElementById('dynamicInsights').innerHTML = `
                 <li style="display: flex; align-items: flex-start; gap: 8px;">
                     <span style="color: var(--accent-orange); font-weight: bold; min-width: 160px;">• Peak Month Analysis:</span>
-                    <span style="color: var(--text-main);"><b>${{maxMonth || 'N/A'}}</b> accounted for <b>${{pct}}%</b> of all lost sales value (RWF ${{(maxMonthVal/1000000).toFixed(2)}}M) within the selected filters.</span>
+                    <span style="color: var(--text-main);"><b>${{maxMonth || 'N/A'}}</b> accounted for <b>${{pct}}%</b> of all lost sales value (RWF ${{formatNum(maxMonthVal)}}) within the selected filters.</span>
                 </li>
                 <li style="display: flex; align-items: flex-start; gap: 8px;">
                     <span style="color: var(--accent-green); font-weight: bold; min-width: 160px;">• Volume Overview:</span>
                     <span style="color: var(--text-main);">Across your selection, a total of <b>${{formatNum(missQty)}} units</b> were unfulfilled out of <b>${{formatNum(ordQty)}} ordered</b>.</span>
                 </li>
             `;
+
+            try {{ updateExtras(); }} catch (e) {{ console.error('Extras error:', e); }}
+        }}
+
+        // ADDED: value-perspective cards, made-vs-missed charts, branch/month/large-order tables and extra insights.
+        // Runs after the original updateDashboard() and only reads rawData/largeData, so the original visuals are never altered.
+        function updateExtras() {{
+            const fMonth = document.getElementById('filterMonth').value;
+            const fType = document.getElementById('filterType').value;
+            const fBranch = document.getElementById('filterBranch').value;
+            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            const hasV = ordValReady;
+            const MADE_C = '#34d399', MISS_C = '#f48a6a', PURPLE_C = '#5a5ce0';
+            const NA = '\u2014';
+            const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
+            const pctOf = (a, b) => b > 0 ? (a / b) * 100 : null;
+            const pctTxt = (x) => x === null ? NA : x.toFixed(1) + '%';
+
+            const pass = (r, useBranch) => {{
+                if (fMonth !== 'All' && r.Month !== fMonth) return false;
+                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
+                if (useBranch && fBranch !== 'All' && r.Branch !== fBranch) return false;
+                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
+                return true;
+            }};
+            const rows = rawData.filter(r => pass(r, true));
+            const baseRows = fBranch === 'All' ? rows : rawData.filter(r => pass(r, false));
+            const blank = () => ({{ordQty: 0, missQty: 0, ordVal: 0, missVal: 0, items: 0, short: 0}});
+            const add = (a, r) => {{ a.ordQty += r.Order_Qty || 0; a.missQty += r.Missed_Qty || 0; a.ordVal += r.Ordered_Value || 0; a.missVal += r.Lost_Value || 0; a.items += r.Total_Lines || 1; a.short += r.Missed_Lines || 0; return a; }};
+            const T = rows.reduce(add, blank());
+            const B = baseRows.reduce(add, blank());
+            const madeVal = T.ordVal - T.missVal;
+
+            // ---- KPI cards
+            document.getElementById('ordValNote').innerHTML = hasV ? '' : '<br>\u26A0 Ordered / Made value needs one re-upload of the Excel file (Data Management panel) to fill the new Ordered_Value column.';
+            document.getElementById('kpiOrdVal').innerText = hasV ? formatNum(T.ordVal) : NA;
+            document.getElementById('kpiMadeVal').innerText = hasV ? formatNum(madeVal) : NA;
+            document.getElementById('kpiRateVal').innerText = hasV ? pctTxt(pctOf(T.missVal, T.ordVal)) : NA;
+            document.getElementById('kpiFulfVal').innerText = hasV ? pctTxt(pctOf(madeVal, T.ordVal)) : NA;
+            document.getElementById('kpiFulfQty').innerText = pctTxt(pctOf(T.ordQty - T.missQty, T.ordQty));
+            Plotly.react('valRateDonut', [{{
+                values: hasV ? [T.missVal, Math.max(T.ordVal - T.missVal, 0)] : [0, 1], labels: ['Missed Value', 'Made Value'],
+                type: 'pie', hole: 0.7, textinfo: 'none', hoverinfo: 'label+percent', marker: {{colors: ['#7f1d1d', '#fecaca']}}
+            }}], {{margin: {{t: 0, b: 0, l: 0, r: 0}}, showlegend: false, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)'}}, {{displayModeBar: false}});
+            document.getElementById('kpiItems').innerText = fmtInt(T.short);
+            document.getElementById('kpiItemsSub').innerHTML = '<span class="items-full">' + fmtInt(T.short) + ' </span>of ' + fmtInt(T.items) + '<span class="items-word"> items</span>';
+            document.getElementById('itemsRateText').innerText = pctTxt(pctOf(T.short, T.items));
+            Plotly.react('itemsDonut', [{{
+                values: [T.short, Math.max(T.items - T.short, 0)], labels: ['Items short', 'Items fully served'],
+                type: 'pie', hole: 0.7, textinfo: 'none', hoverinfo: 'label+percent', marker: {{colors: ['#92400e', '#fef3c7']}}
+            }}], {{margin: {{t: 0, b: 0, l: 0, r: 0}}, showlegend: false, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)'}}, {{staticPlot: false, displayModeBar: false}});
+
+            // ---- Branch aggregation
+            const br = {{}};
+            rows.forEach(r => {{ if (!br[r.Branch]) br[r.Branch] = blank(); add(br[r.Branch], r); }});
+            const brNames = Object.keys(br);
+
+            const stackedBranch = (chartId, names, getMade, getMiss, getAbs, valueMode) => {{
+                if (valueMode && !hasV) {{
+                    Plotly.react(chartId, [], {{margin: {{l: 20, r: 20, t: 10, b: 30}}, xaxis: {{visible: false}}, yaxis: {{visible: false}},
+                        annotations: [{{text: 'Re-upload the Excel once to enable value ordered / made', showarrow: false, font: {{size: 13, color: '#8b95a5'}}}}]}});
+                    return;
+                }}
+                const ys = names.slice().reverse();
+                const made = ys.map(getMade), miss = ys.map(getMiss);
+                Plotly.react(chartId, [
+                    {{x: made, y: ys, type: 'bar', orientation: 'h', name: 'Made', marker: {{color: MADE_C}}, text: made.map(v => v.toFixed(0) + '%'), textposition: 'inside', hovertext: ys.map((b, i) => b + '<br>Made: ' + getAbs(b, 'made') + ' (' + made[i].toFixed(1) + '%)'), hoverinfo: 'text'}},
+                    {{x: miss, y: ys, type: 'bar', orientation: 'h', name: 'Missed', marker: {{color: MISS_C}}, text: miss.map(v => v.toFixed(0) + '%'), textposition: 'inside', hovertext: ys.map((b, i) => b + '<br>Missed: ' + getAbs(b, 'miss') + ' (' + miss[i].toFixed(1) + '%)'), hoverinfo: 'text'}}
+                ], {{barmode: 'stack', margin: {{l: 120, r: 35, t: 10, b: 50}}, xaxis: {{range: [0, 100], ticksuffix: '%'}}, legend: {{orientation: 'h', y: -0.18, traceorder: 'normal'}}}});
+            }};
+            const topV = brNames.slice().sort((a, b) => br[b].missVal - br[a].missVal).slice(0, 10);
+            stackedBranch('madeMissValChart', topV,
+                b => br[b].ordVal > 0 ? ((br[b].ordVal - br[b].missVal) / br[b].ordVal) * 100 : 0,
+                b => br[b].ordVal > 0 ? (br[b].missVal / br[b].ordVal) * 100 : 0,
+                (b, k) => 'RWF ' + formatNum(k === 'made' ? br[b].ordVal - br[b].missVal : br[b].missVal) + ' of RWF ' + formatNum(br[b].ordVal), true);
+            const topQ = brNames.slice().sort((a, b) => br[b].missQty - br[a].missQty).slice(0, 10);
+            stackedBranch('madeMissQtyChart', topQ,
+                b => br[b].ordQty > 0 ? ((br[b].ordQty - br[b].missQty) / br[b].ordQty) * 100 : 0,
+                b => br[b].ordQty > 0 ? (br[b].missQty / br[b].ordQty) * 100 : 0,
+                (b, k) => formatNum(k === 'made' ? br[b].ordQty - br[b].missQty : br[b].missQty) + ' of ' + formatNum(br[b].ordQty) + ' units', false);
+
+            // ---- Branch performance table
+            const branchRows = brNames.map(k => ({{
+                Branch: k,
+                OrdVal: hasV ? br[k].ordVal : null, MadeVal: hasV ? br[k].ordVal - br[k].missVal : null, MissVal: br[k].missVal,
+                RateVal: hasV ? pctOf(br[k].missVal, br[k].ordVal) : null, Share: pctOf(br[k].missVal, B.missVal),
+                OrdQty: br[k].ordQty, MadeQty: br[k].ordQty - br[k].missQty, MissQty: br[k].missQty, RateQty: pctOf(br[k].missQty, br[k].ordQty)}}));
+            tableBranchPerf.clear().rows.add(branchRows).draw();
+
+            // ---- Month aggregation (chronological)
+            const mo = {{}};
+            rows.forEach(r => {{
+                const key = String(r.Date || '').slice(0, 7) || r.Month;
+                if (!mo[key]) mo[key] = Object.assign(blank(), {{label: r.Month}});
+                add(mo[key], r);
+            }});
+            const moKeys = Object.keys(mo).sort();
+            const moLabels = moKeys.map(k => mo[k].label);
+            const moMiss = moKeys.reduce((a, k) => a + mo[k].missVal, 0);
+            tableMonthSum.clear().rows.add(moKeys.map(k => ({{
+                Month: mo[k].label,
+                OrdVal: hasV ? mo[k].ordVal : null, MadeVal: hasV ? mo[k].ordVal - mo[k].missVal : null, MissVal: mo[k].missVal, RateVal: hasV ? pctOf(mo[k].missVal, mo[k].ordVal) : null,
+                OrdQty: mo[k].ordQty, MadeQty: mo[k].ordQty - mo[k].missQty, MissQty: mo[k].missQty, RateQty: pctOf(mo[k].missQty, mo[k].ordQty), Share: pctOf(mo[k].missVal, moMiss)}}))).draw();
+
+            if (hasV) {{
+                Plotly.react('monthValueChart', [
+                    {{x: moLabels, y: moKeys.map(k => mo[k].ordVal - mo[k].missVal), type: 'bar', name: 'Made', marker: {{color: MADE_C}}, text: moKeys.map(k => formatNum(mo[k].ordVal - mo[k].missVal)), textposition: 'auto'}},
+                    {{x: moLabels, y: moKeys.map(k => mo[k].missVal), type: 'bar', name: 'Missed', marker: {{color: MISS_C}}, text: moKeys.map(k => formatNum(mo[k].missVal)), textposition: 'auto'}}
+                ], {{barmode: 'stack', margin: {{l: 60, r: 20, t: 10, b: 50}}, yaxis: {{range: [0, Math.max(...moKeys.map(k => mo[k].ordVal)) * 1.12]}}, legend: {{orientation: 'h', y: -0.2, traceorder: 'normal'}}}});
+                Plotly.react('monthRateChart', [
+                    {{x: moLabels, y: moKeys.map(k => pctOf(mo[k].missVal, mo[k].ordVal) || 0), type: 'bar', name: 'Value %', marker: {{color: MISS_C}}, text: moKeys.map(k => pctTxt(pctOf(mo[k].missVal, mo[k].ordVal))), textposition: 'auto'}},
+                    {{x: moLabels, y: moKeys.map(k => pctOf(mo[k].missQty, mo[k].ordQty) || 0), type: 'bar', name: 'Units %', marker: {{color: PURPLE_C}}, text: moKeys.map(k => pctTxt(pctOf(mo[k].missQty, mo[k].ordQty))), textposition: 'auto'}}
+                ], {{barmode: 'group', margin: {{l: 50, r: 20, t: 10, b: 50}}, yaxis: {{ticksuffix: '%'}}, legend: {{orientation: 'h', y: -0.2, traceorder: 'normal'}}}});
+            }} else {{
+                const msg = {{margin: {{l: 20, r: 20, t: 10, b: 30}}, xaxis: {{visible: false}}, yaxis: {{visible: false}}, annotations: [{{text: 'Re-upload the Excel once to enable value ordered / made', showarrow: false, font: {{size: 13, color: '#8b95a5'}}}}]}};
+                Plotly.react('monthValueChart', [], msg);
+                Plotly.react('monthRateChart', [{{x: moLabels, y: moKeys.map(k => pctOf(mo[k].missQty, mo[k].ordQty) || 0), type: 'bar', name: 'Units %', marker: {{color: PURPLE_C}}, text: moKeys.map(k => pctTxt(pctOf(mo[k].missQty, mo[k].ordQty))), textposition: 'auto'}}],
+                    {{margin: {{l: 50, r: 20, t: 10, b: 50}}, yaxis: {{ticksuffix: '%'}}}});
+            }}
+
+            // ---- Large orders (single items) with the same filters
+            const lg = largeData.filter(r => pass(r, true)).sort((a, b) => b.Lost_Value - a.Lost_Value);
+            tableLarge.clear().rows.add(lg.slice(0, 200)).draw();
+            const lgSum = lg.reduce((a, r) => a + (r.Lost_Value || 0), 0);
+            document.getElementById('kpiLargeShare').innerText = pctTxt(pctOf(lgSum, T.missVal));
+            document.getElementById('kpiLargeSub').innerHTML = fmtInt(lg.length) + (lg.length === 1 ? ' item | ' : ' items | ') + formatNum(lgSum) + '<span class="lg-arrow"> ›</span>';
+            document.getElementById('kpiLargeFormula').innerText = 'Missed of items >= RWF ' + (LARGE_T / 1000000).toFixed(0) + 'M / Total missed';
+
+            // ---- Extra insights (appended under the original two lines)
+            const li = (color, label, html) => '<li style="display: flex; align-items: flex-start; gap: 8px;"><span style="color: ' + color + '; font-weight: bold; min-width: 160px;">&bull; ' + label + '</span><span style="color: var(--text-main);">' + html + '</span></li>';
+            let extra = '';
+            if (hasV) {{
+                extra += li('var(--accent-purple)', 'Value Overview:', 'Of <b>RWF ' + formatNum(T.ordVal) + '</b> ordered, <b>RWF ' + formatNum(madeVal) + '</b> was made (' + pctTxt(pctOf(madeVal, T.ordVal)) + ') and <b>RWF ' + formatNum(T.missVal) + '</b> was missed (' + pctTxt(pctOf(T.missVal, T.ordVal)) + ') in the current selection.');
+            }}
+            if (topV.length) {{
+                const v = topV[0], q = topQ[0];
+                extra += li('var(--accent-orange)', 'Branch Focus:', '<b>' + v + '</b> has the largest value loss: <b>RWF ' + formatNum(br[v].missVal) + '</b>' +
+                    (hasV ? ' = ' + pctTxt(pctOf(br[v].missVal, br[v].ordVal)) + ' of its own orders and ' : ' = ') + pctTxt(pctOf(br[v].missVal, B.missVal)) + ' of all missed value. Most missed units: <b>' + q + '</b> (' + formatNum(br[q].missQty) + ' units, ' + pctTxt(pctOf(br[q].missQty, br[q].ordQty)) + ' of its own orders).');
+            }}
+            if (T.missVal > 0) {{
+                extra += li('#f59e0b', 'Concentration:', 'Items with <b>RWF ' + (LARGE_T / 1000000).toFixed(0) + 'M+</b> missed each make up <b>' + pctTxt(pctOf(lgSum, T.missVal)) + '</b> of missed value (RWF ' + formatNum(lgSum) + ') &mdash; click the Large Orders Share card (or see the table below) to verify them.');
+            }}
+            document.getElementById('dynamicInsights').insertAdjacentHTML('beforeend', extra);
+            try {{ bindDrill(); bindLargeCard(); }} catch (e) {{ console.error('Drill-down bind error:', e); }}
+        }}
+
+        // ADDED: click a branch bar -> branch drill-down window (reads rawData/largeData only; never touches the original charts)
+        let drillBound = false;
+        function bindDrill() {{
+            if (drillBound) return;
+            const ids = ['branchValueChart', 'branchQtyChart', 'madeMissValChart', 'madeMissQtyChart'];
+            let ok = 0;
+            ids.forEach(id => {{
+                const el = document.getElementById(id);
+                if (!el || typeof el.on !== 'function') return;
+                el.on('plotly_click', function(d) {{
+                    if (d && d.points && d.points.length) openDrill(String(d.points[0].y), d.event);
+                }});
+                const panel = el.closest('.panel');
+                const hdr = panel ? panel.querySelector('.panel-header') : null;
+                if (hdr && !hdr.querySelector('.drill-hint') && hdr.firstChild) {{
+                    const w = document.createElement('span');
+                    w.appendChild(hdr.firstChild);
+                    const h = document.createElement('span');
+                    h.className = 'drill-hint';
+                    h.textContent = 'click a bar for branch details';
+                    w.appendChild(h);
+                    hdr.insertBefore(w, hdr.firstChild);
+                }}
+                ok++;
+            }});
+            if (ok > 0) {{
+                document.getElementById('drillClose').addEventListener('click', closeDrill);
+                document.getElementById('drillOverlay').addEventListener('click', function(e) {{ if (e.target.id === 'drillOverlay') closeDrill(); }});
+                document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape') closeDrill(); }});
+                drillBound = true;
+            }}
+        }}
+
+        function closeDrill() {{
+            const o = document.getElementById('drillOverlay');
+            if (!o || o.style.display === 'none') return;
+            o.style.display = 'none';
+            ['drillMonthChart', 'drillProdChart', 'lgBranchChart', 'lgMonthChart'].forEach(id => {{ const e = document.getElementById(id); if (e) {{ try {{ Plotly.purge(e); }} catch (x) {{}} }} }});
+            document.getElementById('drillBody').innerHTML = '';
+        }}
+
+        function openDrill(branch, ev) {{
+            const fMonth = document.getElementById('filterMonth').value;
+            const fType = document.getElementById('filterType').value;
+            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            const hasV = ordValReady;
+            const NA = '\u2014';
+            const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
+            const pctOf = (a, b) => b > 0 ? (a / b) * 100 : null;
+            const pctTxt = (x) => x === null ? NA : x.toFixed(1) + '%';
+            const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const shorten = (s) => s.length > 34 ? s.slice(0, 33) + '\u2026' : s;
+            const MADE_C = '#34d399', MISS_C = '#f48a6a';
+
+            const base = rawData.filter(r => {{
+                if (fMonth !== 'All' && r.Month !== fMonth) return false;
+                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
+                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
+                return true;
+            }});
+            const mine = base.filter(r => r.Branch === branch);
+            const blank = () => ({{ordQty: 0, missQty: 0, ordVal: 0, missVal: 0, items: 0, short: 0}});
+            const add = (a, r) => {{ a.ordQty += r.Order_Qty || 0; a.missQty += r.Missed_Qty || 0; a.ordVal += r.Ordered_Value || 0; a.missVal += r.Lost_Value || 0; a.items += r.Total_Lines || 1; a.short += r.Missed_Lines || 0; return a; }};
+            const T = mine.reduce(add, blank());
+            const A = base.reduce(add, blank());
+            const madeVal = T.ordVal - T.missVal;
+
+            const byB = {{}};
+            base.forEach(r => {{ byB[r.Branch] = (byB[r.Branch] || 0) + (r.Lost_Value || 0); }});
+            const ranked = Object.keys(byB).sort((a, b) => byB[b] - byB[a]);
+            const rank = ranked.indexOf(branch) + 1;
+
+            const mo = {{}};
+            mine.forEach(r => {{ const k = String(r.Date || '').slice(0, 7) || r.Month; if (!mo[k]) mo[k] = Object.assign(blank(), {{label: r.Month}}); add(mo[k], r); }});
+            const mk = Object.keys(mo).sort();
+
+            const pr = {{}};
+            mine.forEach(r => {{
+                if ((r.Missed_Qty || 0) <= 0) return;
+                const k = r.Product_Desc || '(blank)';
+                if (!pr[k]) pr[k] = {{lost: 0, units: 0, items: 0}};
+                pr[k].lost += r.Lost_Value || 0; pr[k].units += r.Missed_Qty || 0; pr[k].items += r.Missed_Lines || 0;
+            }});
+            const prods = Object.keys(pr).sort((a, b) => pr[b].lost - pr[a].lost);
+
+            const lg = largeData.filter(r => r.Branch === branch && (fMonth === 'All' || r.Month === fMonth) && (fType === 'All' || r.Sales_Doc_Type === fType)
+                && (!fSearch || String(r.Product_Desc || "").toLowerCase().includes(fSearch))).sort((a, b) => b.Lost_Value - a.Lost_Value);
+
+            const tile = (label, value, cls) => '<div class="drill-tile"><div class="t-label">' + label + '</div><div class="t-value ' + (cls || '') + '">' + value + '</div></div>';
+            let html = '<div class="drill-tiles">' +
+                tile('Sales ordered (RWF)', hasV ? formatNum(T.ordVal) : NA, 't-ord') +
+                tile('Sales made (RWF)', hasV ? formatNum(madeVal) : NA, 't-made') +
+                tile('Sales missed (RWF)', formatNum(T.missVal), 't-miss') +
+                tile('Missed rate (value)', hasV ? pctTxt(pctOf(T.missVal, T.ordVal)) : NA, 't-miss') +
+                tile('Units ordered', formatNum(T.ordQty), 't-ord') +
+                tile('Units made', formatNum(T.ordQty - T.missQty), 't-made') +
+                tile('Units missed', formatNum(T.missQty), 't-miss') +
+                tile('Missed rate (units)', pctTxt(pctOf(T.missQty, T.ordQty)), 't-miss') + '</div>';
+            html += '<div class="drill-strip"><b>Share of all missed value:</b> ' + pctTxt(pctOf(T.missVal, A.missVal)) +
+                ' <span style="color:var(--text-muted);">(rank #' + rank + ' of ' + ranked.length + ' branches)</span> &nbsp;&bull;&nbsp; ' +
+                '<b>Order items short:</b> ' + fmtInt(T.short) + ' of ' + fmtInt(T.items) + ' (' + pctTxt(pctOf(T.short, T.items)) + ')</div>';
+            html += '<div class="drill-grid2"><div class="drill-panel"><h4>Monthly: made vs missed (RWF)</h4><div id="drillMonthChart" style="height:280px;"></div></div>' +
+                '<div class="drill-panel"><h4>Top 10 missed products (lost RWF)</h4><div id="drillProdChart" style="height:280px;"></div></div></div>';
+
+            let rowsP = '';
+            prods.slice(0, 15).forEach(k => {{
+                rowsP += '<tr><td>' + esc(k) + '</td><td class="num">' + fmtInt(pr[k].items) + '</td><td class="num">' + fmtInt(pr[k].units) + '</td><td class="num">' + fmtInt(pr[k].lost) + '</td><td class="num">' + pctTxt(pctOf(pr[k].lost, T.missVal)) + '</td></tr>';
+            }});
+            html += '<div class="drill-panel"><h4>Top missed products in ' + esc(branch) + '</h4><div class="table-container"><table class="light-table"><thead><tr><th>Product</th><th class="num">Items short</th><th class="num">Missed units</th><th class="num">Lost value (RWF)</th><th class="num">% of branch missed</th></tr></thead><tbody>' +
+                (rowsP || '<tr><td colspan="5">No missed items for the current filters.</td></tr>') + '</tbody></table></div></div>';
+            if (lg.length) {{
+                let rowsL = '';
+                lg.slice(0, 15).forEach(r => {{
+                    rowsL += '<tr><td>' + esc(r.Doc) + '</td><td>' + esc(r.Date) + '</td><td>' + esc(r.Product_Desc) + '</td><td class="num">' + fmtInt(r.Order_Qty) + '</td><td class="num">' + fmtInt(r.Missed_Qty) + '</td><td class="num">' + fmtInt(r.Lost_Value) + '</td></tr>';
+                }});
+                html += '<div class="drill-panel"><h4>Large orders to verify (RWF ' + (LARGE_T / 1000000).toFixed(0) + 'M+ missed per item)</h4><div class="table-container"><table class="light-table"><thead><tr><th>Sales doc</th><th>Doc date</th><th>Product</th><th class="num">Ord qty</th><th class="num">Miss qty</th><th class="num">Lost value (RWF)</th></tr></thead><tbody>' + rowsL + '</tbody></table></div></div>';
+            }}
+
+            document.getElementById('drillTitle').textContent = branch + ' \u2014 branch drill-down';
+            document.getElementById('drillSub').textContent = 'Filters applied \u2014 Month: ' + (fMonth === 'All' ? 'All months' : fMonth) + '  |  Doc type: ' + (fType === 'All' ? 'All types' : fType) + (fSearch ? '  |  Product search: "' + fSearch + '"' : '');
+            document.getElementById('drillBody').innerHTML = html;
+            const overlay = document.getElementById('drillOverlay'), box = document.getElementById('drillBox');
+            const docH = document.documentElement.scrollHeight;
+            overlay.style.height = docH + 'px';
+            overlay.style.display = 'block';
+            const y = (ev && ev.pageY) ? ev.pageY : (window.scrollY + 80);
+            box.style.top = Math.max(10, Math.min(y - 90, docH - box.offsetHeight - 20)) + 'px';
+
+            if (mk.length) {{
+                const lbl = mk.map(k => mo[k].label);
+                const traces = [];
+                if (hasV) traces.push({{x: lbl, y: mk.map(k => mo[k].ordVal - mo[k].missVal), type: 'bar', name: 'Made', marker: {{color: MADE_C}}, text: mk.map(k => formatNum(mo[k].ordVal - mo[k].missVal)), textposition: 'auto'}});
+                traces.push({{x: lbl, y: mk.map(k => mo[k].missVal), type: 'bar', name: 'Missed', marker: {{color: MISS_C}}, text: mk.map(k => formatNum(mo[k].missVal)), textposition: 'auto'}});
+                Plotly.newPlot('drillMonthChart', traces, {{barmode: 'stack', margin: {{l: 60, r: 15, t: 10, b: 45}}, legend: {{orientation: 'h', y: -0.2, traceorder: 'normal'}}}}, {{displayModeBar: false}});
+            }}
+            const top10 = prods.slice(0, 10).reverse();
+            if (top10.length) {{
+                Plotly.newPlot('drillProdChart', [{{x: top10.map(k => pr[k].lost), y: top10.map(k => shorten(k)), type: 'bar', orientation: 'h', marker: {{color: MISS_C}},
+                    text: top10.map(k => formatNum(pr[k].lost)), textposition: 'auto', hovertext: top10.map(k => k + '<br>RWF ' + fmtInt(pr[k].lost)), hoverinfo: 'text'}}],
+                    {{margin: {{l: 10, r: 25, t: 10, b: 30}}, yaxis: {{automargin: true}}}}, {{displayModeBar: false}});
+            }}
+            try {{ box.setAttribute('tabindex', '-1'); box.focus({{preventScroll: true}}); }} catch (e) {{}}
+            try {{ box.scrollIntoView({{block: 'start', behavior: 'smooth'}}); }} catch (e) {{}}
+        }}
+        // ADDED: click the "Large Orders Share" card -> list of the large orders (same window as the branch drill-down)
+        let largeCardBound = false;
+        function bindLargeCard() {{
+            if (largeCardBound) return;
+            const c = document.getElementById('largeCard');
+            if (!c) return;
+            c.addEventListener('click', function(e) {{ openLargeDrill(e); }});
+            c.addEventListener('keydown', function(e) {{ if (e.key === 'Enter' || e.key === ' ') {{ e.preventDefault(); openLargeDrill(null); }} }});
+            largeCardBound = true;
+        }}
+
+        function openLargeDrill(ev) {{
+            const fMonth = document.getElementById('filterMonth').value;
+            const fType = document.getElementById('filterType').value;
+            const fBranch = document.getElementById('filterBranch').value;
+            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            const NA = '\u2014';
+            const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
+            const pctOf = (a, b) => b > 0 ? (a / b) * 100 : null;
+            const pctTxt = (x) => x === null ? NA : x.toFixed(1) + '%';
+            const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const MISS_C = '#f48a6a', PURPLE_C = '#5a5ce0';
+            const pass = (r) => {{
+                if (fMonth !== 'All' && r.Month !== fMonth) return false;
+                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
+                if (fBranch !== 'All' && r.Branch !== fBranch) return false;
+                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
+                return true;
+            }};
+            const totMiss = rawData.filter(pass).reduce((a, r) => a + (r.Lost_Value || 0), 0);
+            const lg = largeData.filter(pass).sort((a, b) => b.Lost_Value - a.Lost_Value);
+            const lgSum = lg.reduce((a, r) => a + (r.Lost_Value || 0), 0);
+            const lgUnits = lg.reduce((a, r) => a + (r.Missed_Qty || 0), 0);
+            const byBranch = {{}}, byMonth = {{}};
+            lg.forEach(r => {{
+                byBranch[r.Branch] = (byBranch[r.Branch] || 0) + (r.Lost_Value || 0);
+                const k = String(r.Date || '').slice(0, 7) || r.Month;
+                if (!byMonth[k]) byMonth[k] = {{label: r.Month, v: 0}};
+                byMonth[k].v += r.Lost_Value || 0;
+            }});
+            const thr = 'RWF ' + (LARGE_T / 1000000).toFixed(0) + 'M';
+            const tile = (label, value, cls) => '<div class="drill-tile"><div class="t-label">' + label + '</div><div class="t-value ' + (cls || '') + '">' + value + '</div></div>';
+            let html = '';
+            if (!lg.length) {{
+                html += '<div class="drill-strip">No single order item reaches ' + thr + ' of missed value under the current filters.</div>';
+            }} else {{
+                html += '<div class="drill-tiles">' +
+                    tile('Large items', fmtInt(lg.length), 't-ord') +
+                    tile('Missed value in them (RWF)', formatNum(lgSum), 't-miss') +
+                    tile('Share of all missed value', pctTxt(pctOf(lgSum, totMiss)), 't-miss') +
+                    tile('Total missed value (RWF)', formatNum(totMiss), 't-miss') +
+                    tile('Missed units in them', formatNum(lgUnits), 't-miss') +
+                    tile('Average per large item (RWF)', formatNum(lgSum / lg.length), 't-ord') +
+                    tile('Largest single item (RWF)', formatNum(lg[0].Lost_Value), 't-miss') +
+                    tile('Branches affected', fmtInt(Object.keys(byBranch).length), 't-ord') + '</div>';
+                html += '<div class="drill-strip"><b>Large order</b> = a single order item with ' + thr + '+ of missed value. These items make up <b>' + pctTxt(pctOf(lgSum, totMiss)) +
+                    '</b> of the missed value, so they are worth verifying (quantity, price, duplicate entry) with the branch before treating them as real lost sales.</div>';
+                html += '<div class="drill-grid2"><div class="drill-panel"><h4>Large-order missed value by branch (RWF)</h4><div id="lgBranchChart" style="height:260px;"></div></div>' +
+                    '<div class="drill-panel"><h4>Large-order missed value by month (RWF)</h4><div id="lgMonthChart" style="height:260px;"></div></div></div>';
+                let rows = '';
+                lg.slice(0, 200).forEach(r => {{
+                    rows += '<tr><td>' + esc(r.Doc) + '</td><td>' + esc(r.Item) + '</td><td>' + esc(r.Date) + '</td><td>' + esc(r.Branch) + '</td><td>' + esc(r.Product_Desc) + '</td>' +
+                        '<td class="num">' + fmtInt(r.Order_Qty) + '</td><td class="num">' + fmtInt(r.Confirmed_Qty) + '</td><td class="num">' + fmtInt(r.Missed_Qty) + '</td>' +
+                        '<td class="num">' + fmtInt(r.Lost_Value) + '</td><td class="num">' + pctTxt(pctOf(r.Lost_Value, totMiss)) + '</td></tr>';
+                }});
+                html += '<div class="drill-panel"><h4>All large orders in the current selection (' + fmtInt(lg.length) + ')</h4><div class="table-container"><table class="light-table"><thead><tr>' +
+                    '<th>Sales doc</th><th>Item</th><th>Doc date</th><th>Branch</th><th>Product</th><th class="num">Ord qty</th><th class="num">Del qty</th><th class="num">Miss qty</th><th class="num">Lost value (RWF)</th><th class="num">% of missed value</th>' +
+                    '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+            }}
+            document.getElementById('drillTitle').textContent = 'Large orders \u2014 ' + thr + '+ missed per item';
+            document.getElementById('drillSub').textContent = 'Filters applied \u2014 Month: ' + (fMonth === 'All' ? 'All months' : fMonth) + '  |  Doc type: ' + (fType === 'All' ? 'All types' : fType) + '  |  Branch: ' + (fBranch === 'All' ? 'All branches' : fBranch) + (fSearch ? '  |  Product search: "' + fSearch + '"' : '');
+            document.getElementById('drillBody').innerHTML = html;
+            const overlay = document.getElementById('drillOverlay'), box = document.getElementById('drillBox');
+            const docH = document.documentElement.scrollHeight;
+            overlay.style.height = docH + 'px';
+            overlay.style.display = 'block';
+            const y = (ev && ev.pageY) ? ev.pageY : (window.scrollY + 80);
+            box.style.top = Math.max(10, Math.min(y - 90, docH - box.offsetHeight - 20)) + 'px';
+            if (lg.length) {{
+                const bk = Object.keys(byBranch).sort((a, b) => byBranch[a] - byBranch[b]).slice(-10);
+                Plotly.newPlot('lgBranchChart', [{{x: bk.map(k => byBranch[k]), y: bk, type: 'bar', orientation: 'h', marker: {{color: MISS_C}}, text: bk.map(k => formatNum(byBranch[k])), textposition: 'auto'}}],
+                    {{margin: {{l: 10, r: 25, t: 10, b: 30}}, yaxis: {{automargin: true}}}}, {{displayModeBar: false}});
+                const mk = Object.keys(byMonth).sort();
+                Plotly.newPlot('lgMonthChart', [{{x: mk.map(k => byMonth[k].label), y: mk.map(k => byMonth[k].v), type: 'bar', marker: {{color: PURPLE_C}}, text: mk.map(k => formatNum(byMonth[k].v)), textposition: 'auto'}}],
+                    {{margin: {{l: 60, r: 15, t: 10, b: 40}}}}, {{displayModeBar: false}});
+            }}
+            try {{ box.setAttribute('tabindex', '-1'); box.focus({{preventScroll: true}}); }} catch (e) {{}}
+            try {{ box.scrollIntoView({{block: 'start', behavior: 'smooth'}}); }} catch (e) {{}}
         }}
         window.onload = initApp;
     </script>
@@ -598,7 +1283,7 @@ html_template = f"""
 """
 
 # Render the HTML
-components.html(html_template, height=1950, scrolling=True)
+components.html(html_template, height=4300, scrolling=True)
 
 # ---------------------------------------------------------------------
 # 5. BOTTOM ADMIN PANEL

@@ -32,10 +32,15 @@ def init_db():
             "Confirmed_Qty" REAL,
             "Missed_Qty" REAL,
             "Lost_Value" REAL,
+            "Ordered_Value" REAL,
             UNIQUE("Sales Document", "Sales Document Item")
         )
     ''')
     # 2. Indexes make retrieving and aggregating the data exponentially faster
+    # Migration: databases created before the Ordered_Value column existed get it added (existing data is untouched)
+    existing_cols = [r[1] for r in conn.execute('PRAGMA table_info(sales)').fetchall()]
+    if 'Ordered_Value' not in existing_cols:
+        conn.execute('ALTER TABLE sales ADD COLUMN "Ordered_Value" REAL')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON sales("Document Date")')
     conn.commit()
     conn.close()
@@ -115,9 +120,10 @@ def upload_sales(file_buffer):
     df_new['Missed_Qty'] = (df_new['Order_Qty'] - df_new['Confirmed_Qty']).clip(lower=0)
     net_price = pd.to_numeric(df_new.get('Net Price', 0), errors='coerce').fillna(0)
     df_new['Lost_Value'] = df_new['Missed_Qty'] * net_price
+    df_new['Ordered_Value'] = df_new['Order_Qty'] * net_price   # RWF value of what was ordered (used for Sales Made / rates)
     
     # Drop raw columns we no longer need to save physical disk space
-    cols_to_keep = ['Sales Document', 'Sales Document Item', 'Document Date', 'Sales Document Type', 'Plant', 'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value']
+    cols_to_keep = ['Sales Document', 'Sales Document Item', 'Document Date', 'Sales Document Type', 'Plant', 'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value', 'Ordered_Value']
     df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
     
     conn = get_connection()
@@ -129,14 +135,28 @@ def upload_sales(file_buffer):
     conn.execute('''
         INSERT OR IGNORE INTO sales (
             "Sales Document", "Sales Document Item", "Document Date", "Sales Document Type", 
-            "Plant", "Material Description", "Order_Qty", "Confirmed_Qty", "Missed_Qty", "Lost_Value"
+            "Plant", "Material Description", "Order_Qty", "Confirmed_Qty", "Missed_Qty", "Lost_Value", "Ordered_Value"
         )
         SELECT 
             "Sales Document", "Sales Document Item", "Document Date", "Sales Document Type", 
-            "Plant", "Material Description", "Order_Qty", "Confirmed_Qty", "Missed_Qty", "Lost_Value"
+            "Plant", "Material Description", "Order_Qty", "Confirmed_Qty", "Missed_Qty", "Lost_Value", "Ordered_Value"
         FROM temp_sales
     ''')
     
+    # 5b. Backfill Ordered_Value for rows saved before this column existed (only fills empty cells, never overwrites)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_temp_key ON temp_sales("Sales Document", "Sales Document Item")')
+    conn.execute('''
+        UPDATE sales SET "Ordered_Value" = (
+            SELECT t."Ordered_Value" FROM temp_sales t
+            WHERE t."Sales Document" = sales."Sales Document" AND t."Sales Document Item" = sales."Sales Document Item"
+        )
+        WHERE "Ordered_Value" IS NULL
+          AND EXISTS (
+            SELECT 1 FROM temp_sales t
+            WHERE t."Sales Document" = sales."Sales Document" AND t."Sales Document Item" = sales."Sales Document Item"
+          )
+    ''')
+
     conn.execute("DROP TABLE temp_sales")
     conn.commit()
     conn.close()
