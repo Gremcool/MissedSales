@@ -32,6 +32,33 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------
+# 2a. COMPACT DATA PACKING (the dashboard data used to be sent as ~30 MB of JSON; this sends the same rows in ~5 MB)
+# ---------------------------------------------------------------------
+def pack_rows(d):
+    """Column-wise, dictionary-encoded JSON. The browser rebuilds exactly the same list of records from it."""
+    import json
+    d = d.fillna(0)
+    text_cols = {'Month', 'Week_Start', 'Week_Range', 'Date', 'Sales_Doc_Type', 'Branch', 'Product_Desc'}
+    keys = list(d.columns)
+    dicts, cols = {}, {}
+    for k in keys:
+        vals = d[k].tolist()
+        if k in text_cols:
+            index, uniques, codes = {}, [], []
+            for v in vals:
+                i = index.get(v)
+                if i is None:
+                    i = index[v] = len(uniques)
+                    uniques.append(v)
+                codes.append(i)
+            dicts[k] = uniques
+            cols[k] = codes
+        else:
+            cols[k] = [int(v) if isinstance(v, float) and v.is_integer() else v for v in vals]
+    out = json.dumps({'n': len(d), 'keys': keys, 'dict': dicts, 'cols': cols}, separators=(',', ':'))
+    return out.replace('</', '<\\/')
+
+# ---------------------------------------------------------------------
 # 2. DATA PROCESSING (Cached for Instant Reloads)
 # ---------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
@@ -71,10 +98,10 @@ def load_and_prep_data():
             'Material Description': 'Product_Desc'
         })
         
-        json_data = df_agg.fillna(0).to_json(orient='records')
+        json_data = pack_rows(df_agg)
         return df, db_stats, json_data
     else:
-        return df, db_stats, "[]"
+        return df, db_stats, '{"n":0,"keys":[],"dict":{},"cols":{}}'
 
 # Call the cached data loader
 df, db_stats, json_data = load_and_prep_data()
@@ -665,7 +692,19 @@ html_template = f"""
 
     <!-- JAVASCRIPT: INSTANT FILTERING & RENDERING -->
     <script>
-        const rawData = {json_data};
+        const rawPacked = {json_data};
+        const rawData = (function (p) {{
+            const out = new Array(p.n);
+            for (let i = 0; i < p.n; i++) {{
+                const o = {{}};
+                for (let k = 0; k < p.keys.length; k++) {{
+                    const key = p.keys[k], d = p.dict[key];
+                    o[key] = d ? d[p.cols[key][i]] : p.cols[key][i];
+                }}
+                out[i] = o;
+            }}
+            return out;
+        }})(rawPacked);
         let tableDetails, tableLoc, tableItems;
         const largeData = {large_json};
         const ordValReady = {ORDVAL_READY_JS};
