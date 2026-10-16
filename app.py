@@ -2,10 +2,17 @@ import streamlit as st
 import pandas as pd
 import database
 import streamlit.components.v1 as components
+import os
+from datetime import date, timedelta
 
 # ---------------------------------------------------------------------
 # 1. STREAMLIT CONFIG, STATE INIT, & CSS
 # ---------------------------------------------------------------------
+try:
+    database.start_scheduler()      # automatic API sync timer (does nothing until switched on in the admin panel)
+except Exception:
+    pass
+
 st.set_page_config(page_title="Unfulfilled Deliveries Dashboard", layout="wide", initial_sidebar_state="collapsed")
 
 # Initialize session state immediately
@@ -61,8 +68,8 @@ def pack_rows(d):
 # ---------------------------------------------------------------------
 # 2. DATA PROCESSING (Cached for Instant Reloads)
 # ---------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_and_prep_data():
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_and_prep_data(data_version=0):
     df = database.get_data()
     db_stats = database.get_db_stats()
     
@@ -104,14 +111,14 @@ def load_and_prep_data():
         return df, db_stats, '{"n":0,"keys":[],"dict":{},"cols":{}}'
 
 # Call the cached data loader
-df, db_stats, json_data = load_and_prep_data()
+df, db_stats, json_data = load_and_prep_data(database.data_version())
 
 # --- Extras for the added value-perspective cards, charts and tables (additive; nothing above is changed) ---
 LARGE_THRESHOLD = 25000000   # RWF missed per single order item that counts as a "large order" to verify
 ORDVAL_READY = bool((not df.empty) and ('Ordered_Value' in df.columns) and df['Ordered_Value'].notna().all())
 ORDVAL_READY_JS = 'true' if ORDVAL_READY else 'false'
 if not df.empty:
-    _large = df[df['Lost_Value'] >= LARGE_THRESHOLD][['Sales Document', 'Sales Document Item', 'Date', 'Month', 'Sales Document Type', 'Branch', 'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value']].rename(columns={
+    _large = df[df['Lost_Value'] >= LARGE_THRESHOLD][['Sales Document', 'Sales Document Item', 'Date', 'Month', 'Week_Start', 'Sales Document Type', 'Branch', 'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value']].rename(columns={
         'Sales Document': 'Doc', 'Sales Document Item': 'Item', 'Sales Document Type': 'Sales_Doc_Type', 'Material Description': 'Product_Desc'})
     large_json = _large.fillna(0).to_json(orient='records')
 else:
@@ -323,6 +330,51 @@ html_template = f"""
         .drill-panel td.num, .drill-panel th.num {{ text-align: right; }}
         .drill-panel .light-table th, .drill-panel .light-table td {{ padding: 8px 6px; font-size: 0.76rem; }}
         .drill-panel .light-table td:nth-child(5) {{ white-space: normal; }}
+
+        /* ---- Added: checkbox dropdowns (multi-select), week dropdown and calendar. The closed buttons look exactly like the old selects. ---- */
+        .msel {{ position: relative; }}
+        .msel-btn {{ display: block; width: 100%; box-sizing: border-box; text-align: left; font-family: 'Inter', sans-serif; font-size: 0.85rem; font-weight: 600; line-height: normal; cursor: pointer; background-color: var(--accent-purple); border: 1px solid rgba(255, 255, 255, 0.3); color: white; padding: 10px 34px 10px 14px; border-radius: 6px; outline: none; box-shadow: inset 0 1px 2px rgba(255,255,255,0.1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .selectBox:hover .msel-btn {{ background-color: #4c4eb8; }}
+        .msel.open .msel-btn {{ background-color: #4c4eb8; }}
+        .msel-panel {{ display: none; position: absolute; left: 0; top: calc(100% + 4px); width: 100%; min-width: 210px; box-sizing: border-box; background: #fff; color: var(--text-main); border: 1px solid var(--border-color); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.20); z-index: 500; padding: 6px; }}
+        .msel.open .msel-panel {{ display: block; }}
+        .filter-group .msel-panel .msel-search {{ display: block; width: 100%; box-sizing: border-box; padding: 7px 9px; margin: 0 0 4px 0; border: 1px solid var(--border-color); border-radius: 6px; background: #fff; color: var(--text-main); font-family: 'Inter', sans-serif; font-size: 0.8rem; }}
+        .filter-group .msel-panel .msel-search::placeholder {{ color: var(--text-muted); }}
+        .msel-list {{ max-height: 230px; overflow-y: auto; }}
+        .filter-group .msel-panel label.msel-row {{ display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; font-size: 0.82rem; font-weight: 500; color: var(--text-main); text-transform: none; letter-spacing: 0; }}
+        .filter-group .msel-panel label.msel-row:hover {{ background: #f1f2fb; }}
+        .filter-group .msel-panel label.msel-all {{ font-weight: 700; border-bottom: 1px solid var(--border-color); border-radius: 6px 6px 0 0; margin-bottom: 2px; }}
+        .filter-group .msel-panel input[type=checkbox] {{ width: 15px; height: 15px; margin: 0; padding: 0; flex: 0 0 15px; accent-color: var(--accent-purple); cursor: pointer; background: transparent; }}
+        .msel-empty {{ padding: 8px; color: var(--text-muted); font-size: 0.8rem; }}
+        .cal-panel {{ display: none; position: absolute; left: 0; top: calc(100% + 4px); width: 300px; box-sizing: border-box; background: #fff; color: var(--text-main); border: 1px solid var(--border-color); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.22); z-index: 600; padding: 10px; }}
+        .msel.open .cal-panel {{ display: block; }}
+        .cal-tabs {{ display: flex; gap: 4px; background: #f1f2fb; border-radius: 8px; padding: 3px; margin-bottom: 8px; }}
+        .cal-tab {{ flex: 1; text-align: center; padding: 5px 0; border-radius: 6px; cursor: pointer; font-size: 0.75rem; font-weight: 700; color: var(--text-muted); user-select: none; }}
+        .cal-tab.active {{ background: var(--accent-purple); color: #fff; }}
+        .cal-head {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }}
+        .cal-nav {{ cursor: pointer; padding: 4px 12px; border-radius: 6px; font-weight: 800; font-size: 1rem; color: var(--accent-purple); user-select: none; }}
+        .cal-nav:hover, .cal-title:hover {{ background: #f1f2fb; }}
+        .cal-title {{ cursor: pointer; font-weight: 700; font-size: 0.88rem; padding: 4px 8px; border-radius: 6px; user-select: none; }}
+        .cal-grid {{ display: flex; flex-direction: column; gap: 2px; }}
+        .cal-row {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; border-radius: 6px; }}
+        .cal-dow {{ text-align: center; font-size: 0.65rem; font-weight: 700; color: var(--text-muted); padding: 3px 0; }}
+        .cal-day {{ text-align: center; padding: 6px 0; border-radius: 6px; font-size: 0.78rem; font-weight: 600; cursor: pointer; color: var(--text-main); user-select: none; }}
+        .cal-day.out {{ color: #aab3c0; font-weight: 500; }}
+        .cal-day.nodata {{ color: #d3d8e0; cursor: not-allowed; font-weight: 500; }}
+        .cal-day.hasdata:hover {{ background: #e9eafd; }}
+        .cal-day.sel {{ background: var(--accent-purple); color: #fff; }}
+        .cal-grid.weekmode .cal-row.hasdata:hover .cal-day {{ background: #e9eafd; }}
+        .cal-day.sel, .cal-day.sel:hover, .cal-day.hasdata.sel:hover {{ background: var(--accent-purple); color: #fff; }}
+        .cal-grid.weekmode .cal-row.wsel .cal-day, .cal-grid.weekmode .cal-row.wsel:hover .cal-day {{ background: var(--accent-purple); color: #fff; }}
+        .cal-months {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }}
+        .cal-m {{ text-align: center; padding: 10px 0; border-radius: 8px; border: 1px solid var(--border-color); font-size: 0.82rem; font-weight: 700; cursor: pointer; user-select: none; }}
+        .cal-m:hover {{ background: #e9eafd; }}
+        .cal-m.sel {{ background: var(--accent-purple); color: #fff; border-color: var(--accent-purple); }}
+        .cal-m.nodata {{ color: #c5ccd6; cursor: not-allowed; background: #fafbfd; }}
+        .cal-foot {{ display: flex; justify-content: space-between; gap: 6px; margin-top: 8px; }}
+        .cal-btn {{ cursor: pointer; font-size: 0.72rem; font-weight: 700; color: var(--accent-purple); padding: 4px 8px; border-radius: 6px; user-select: none; }}
+        .cal-btn:hover {{ background: #f1f2fb; }}
+        .cal-hint {{ margin-top: 6px; font-size: 0.7rem; color: var(--text-muted); }}
     </style>
 </head>
 <body>
@@ -344,20 +396,40 @@ html_template = f"""
             <h2>Filters</h2>
             <div class="filter-group">
                 <label>Month</label>
-                <div class="selectBox">
-                    <select id="filterMonth"><option value="All">All Months</option></select>
+                <div class="selectBox msel" id="mselMonth">
+                    <button type="button" class="msel-btn" id="mselMonthBtn">All Months</button>
+                    <div class="msel-panel" id="mselMonthPanel"></div>
+                    <select id="filterMonth" style="display:none"><option value="All">All Months</option></select>
+                </div>
+            </div>
+            <div class="filter-group">
+                <label>Week</label>
+                <div class="selectBox msel" id="mselWeek">
+                    <button type="button" class="msel-btn" id="mselWeekBtn">All Weeks</button>
+                    <div class="msel-panel" id="mselWeekPanel"></div>
+                </div>
+            </div>
+            <div class="filter-group">
+                <label>Calendar</label>
+                <div class="selectBox msel" id="calBox">
+                    <button type="button" class="msel-btn" id="calBtn">All dates</button>
+                    <div class="cal-panel" id="calPanel"></div>
                 </div>
             </div>
             <div class="filter-group">
                 <label >Sales Document Type</label>
-                <div class="selectBox">
-                    <select id="filterType"><option value="All">All Types</option></select>
+                <div class="selectBox msel" id="mselType">
+                    <button type="button" class="msel-btn" id="mselTypeBtn">All Types</button>
+                    <div class="msel-panel" id="mselTypePanel"></div>
+                    <select id="filterType" style="display:none"><option value="All">All Types</option></select>
                 </div>
             </div>
             <div class="filter-group">
                 <label>Branch Name</label>
-                <div class="selectBox">
-                    <select id="filterBranch"><option value="All">All Branches</option></select>
+                <div class="selectBox msel" id="mselBranch">
+                    <button type="button" class="msel-btn" id="mselBranchBtn">All Branches</button>
+                    <div class="msel-panel" id="mselBranchPanel"></div>
+                    <select id="filterBranch" style="display:none"><option value="All">All Branches</option></select>
                 </div>
             </div>
             <div class="filter-group">
@@ -710,6 +782,7 @@ html_template = f"""
         const ordValReady = {ORDVAL_READY_JS};
         const LARGE_T = {LARGE_THRESHOLD};
         let tableBranchPerf, tableMonthSum, tableLarge;
+        let defaultMonth = 'All';   // set to the latest month once the data is loaded
 
         const btnConfig = [
             {{ extend: 'excelHtml5', text: '📥 Excel', className: 'dt-btn' }},
@@ -791,38 +864,298 @@ html_template = f"""
                 }});
             }} catch (e) {{ console.error('Extra tables init error:', e); }}
 
+            initFilters();   // checkbox dropdowns, week dropdown and calendar
+
             // Listeners
             document.getElementById('filterMonth').addEventListener('change', updateDashboard);
             document.getElementById('filterType').addEventListener('change', updateDashboard);
             document.getElementById('filterBranch').addEventListener('change', updateDashboard);
             document.getElementById('filterSearch').addEventListener('keyup', updateDashboard);
 
-            updateDashboard();
+            updateDashboard();   // first draw with all months: keeps the table column widths exactly as they always were
+
+            // ADDED: then switch to the latest month in the data ("All Months" is still one click away)
+            try {{
+                let latest = null, latestMonth = 'All';
+                rawData.forEach(r => {{ if (r.Date && (latest === null || r.Date > latest)) {{ latest = r.Date; latestMonth = r.Month; }} }});
+                defaultMonth = latestMonth;
+                if (latestMonth !== 'All') {{
+                    FILT.months = new Set([latestMonth]);
+                    refreshAll();
+                    updateDashboard();
+                }}
+            }} catch (e) {{ console.error('Default month error:', e); }}
         }}
 
-        function resetFilters() {{
-            document.getElementById('filterMonth').value = 'All';
-            document.getElementById('filterType').value = 'All';
-            document.getElementById('filterBranch').value = 'All';
-            document.getElementById('filterSearch').value = '';
+        // ===================== ADDED: checkbox filters, week dropdown and calendar =====================
+        // FILT holds the current choice. An EMPTY set means "All". Every chart, table and window reads the filters only through matchRow().
+        const FILT = {{months: new Set(), weeks: new Set(), types: new Set(), branches: new Set(), dayFrom: null, dayTo: null, search: ''}};
+        const MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        let MONTH_ORDER = [], WEEK_INFO = {{}}, WEEKS_BY_MONTH = {{}}, WEEK_MONTHS = {{}}, DATE_MONTH = {{}}, MULTI_YEAR = false;
+        const MS = {{}};
+        const CAL = {{mode: 'day', view: 'days', year: 2026, month: 0, rangeStart: null}};
+        let updateTimer = null;
+
+        function matchRow(r, skip) {{
+            skip = skip || {{}};
+            if (!skip.month && FILT.months.size && !FILT.months.has(r.Month)) return false;
+            if (!skip.week && FILT.weeks.size && !FILT.weeks.has(r.Week_Start)) return false;
+            if (!skip.day && FILT.dayFrom !== null && (r.Date < FILT.dayFrom || r.Date > FILT.dayTo)) return false;
+            if (!skip.type && FILT.types.size && !FILT.types.has(r.Sales_Doc_Type)) return false;
+            if (!skip.branch && FILT.branches.size && !FILT.branches.has(r.Branch)) return false;
+            if (!skip.search && FILT.search && !String(r.Product_Desc || "").toLowerCase().includes(FILT.search)) return false;
+            return true;
+        }}
+        function syncSearch() {{ FILT.search = document.getElementById('filterSearch').value.toLowerCase(); }}
+        function escHtml(s) {{ return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }}
+        function sortedMonths(set) {{ return MONTH_ORDER.filter(m => set.has(m)); }}
+        function weekLabel(ws) {{ const base = WEEK_INFO[ws] || ws; return MULTI_YEAR ? base + ', ' + ws.slice(0, 4) : base; }}
+        function fmtDay(d, withYear) {{ const p = d.split('-'); return MON3[parseInt(p[1], 10) - 1] + ' ' + parseInt(p[2], 10) + (withYear ? ', ' + p[0] : ''); }}
+        function pad2(n) {{ return (n < 10 ? '0' : '') + n; }}
+        function ymd(y, m, d) {{ return y + '-' + pad2(m + 1) + '-' + pad2(d); }}
+        function utcDate(y, m, d) {{ return new Date(Date.UTC(y, m, d)); }}
+        function weekStartOf(ds) {{
+            const p = ds.split('-').map(Number);
+            const dt = utcDate(p[0], p[1] - 1, p[2]);
+            dt.setUTCDate(dt.getUTCDate() - ((dt.getUTCDay() + 6) % 7));
+            return ymd(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate());
+        }}
+        function hasDataDay(ds) {{ return DATE_MONTH[ds] !== undefined; }}
+
+        // text used in the windows that open from a click (branch drill-down, large orders)
+        function describeFilters(withBranch) {{
+            const parts = ['Month: ' + (FILT.months.size ? sortedMonths(FILT.months).join(', ') : 'All months')];
+            if (FILT.weeks.size) parts.push('Week: ' + [...FILT.weeks].sort().map(weekLabel).join('; '));
+            if (FILT.dayFrom !== null) parts.push('Day: ' + (FILT.dayFrom === FILT.dayTo ? fmtDay(FILT.dayFrom, true) : fmtDay(FILT.dayFrom, true) + ' - ' + fmtDay(FILT.dayTo, true)));
+            parts.push('Doc type: ' + (FILT.types.size ? [...FILT.types].sort().join(', ') : 'All types'));
+            if (withBranch) parts.push('Branch: ' + (FILT.branches.size ? [...FILT.branches].sort().join(', ') : 'All branches'));
+            if (FILT.search) parts.push('Product search: "' + FILT.search + '"');
+            return 'Filters applied \u2014 ' + parts.join('  |  ');
+        }}
+
+        // ---------- checkbox dropdowns ----------
+        function weekOptions() {{
+            let weeks;
+            if (FILT.months.size) {{ const s = new Set(); FILT.months.forEach(m => (WEEKS_BY_MONTH[m] || []).forEach(w => s.add(w))); weeks = [...s]; }}
+            else weeks = Object.keys(WEEK_INFO);
+            return weeks.sort().map(w => ({{value: w, label: weekLabel(w)}}));
+        }}
+        function buildMSel(key, boxId, allLabel, getOptions, getSet, searchable) {{
+            const box = document.getElementById(boxId);
+            const m = {{key: key, box: box, btn: box.querySelector('.msel-btn'), panel: box.querySelector('.msel-panel'), allLabel: allLabel, getOptions: getOptions, getSet: getSet, searchable: searchable, opts: []}};
+            MS[key] = m;
+            m.btn.addEventListener('click', function(e) {{ e.stopPropagation(); togglePanel(key); }});
+            m.panel.addEventListener('click', function(e) {{ e.stopPropagation(); }});
+            m.panel.addEventListener('change', function(e) {{ if (e.target.type === 'checkbox') onMSelChange(key, e.target); }});
+            m.panel.addEventListener('input', function(e) {{
+                if (!e.target.classList.contains('msel-search')) return;
+                const q = e.target.value.toLowerCase();
+                m.panel.querySelectorAll('.msel-list .msel-row').forEach(row => {{ row.style.display = (row.getAttribute('data-label') || '').indexOf(q) >= 0 ? '' : 'none'; }});
+            }});
+        }}
+        function renderPanel(key) {{
+            const m = MS[key];
+            m.opts = m.getOptions();
+            let h = m.searchable ? '<input class="msel-search" type="text" placeholder="Search...">' : '';
+            h += '<label class="msel-row msel-all"><input type="checkbox" data-all="1"><span>' + escHtml(m.allLabel) + '</span></label><div class="msel-list">';
+            m.opts.forEach(o => {{ h += '<label class="msel-row" data-label="' + escHtml(String(o.label).toLowerCase()) + '"><input type="checkbox" value="' + escHtml(o.value) + '"><span>' + escHtml(o.label) + '</span></label>'; }});
+            if (!m.opts.length) h += '<div class="msel-empty">No options</div>';
+            m.panel.innerHTML = h + '</div>';
+            m.sig = m.opts.map(o => o.value).join(',');
+            refreshMSel(key);
+        }}
+        // the Week list must always match the chosen months (also at start-up and after any change made by the calendar or Reset)
+        function syncWeekOptions() {{
+            const m = MS.week;
+            if (m && weekOptions().map(o => o.value).join(',') !== m.sig) renderPanel('week');
+        }}
+        function refreshMSel(key) {{
+            const m = MS[key], set = m.getSet();
+            m.panel.querySelectorAll('input[type=checkbox]').forEach(cb => {{ cb.checked = cb.hasAttribute('data-all') ? set.size === 0 : set.has(cb.value); }});
+            let txt;
+            if (set.size === 0) txt = m.allLabel;
+            else if (set.size === 1) {{ const v = [...set][0], o = m.opts.find(x => x.value === v); txt = o ? o.label : v; }}
+            else txt = set.size + ' selected';
+            m.btn.textContent = txt;
+            m.btn.title = txt;
+        }}
+        function closePanels(except) {{
+            Object.keys(MS).forEach(k => {{ if (k !== except) MS[k].box.classList.remove('open'); }});
+            if (except !== 'cal') document.getElementById('calBox').classList.remove('open');
+        }}
+        function togglePanel(key) {{
+            const m = MS[key], was = m.box.classList.contains('open');
+            closePanels(was ? null : key);
+            m.box.classList.toggle('open', !was);
+            if (!was && m.searchable) {{ const s = m.panel.querySelector('.msel-search'); if (s) {{ s.value = ''; s.dispatchEvent(new Event('input', {{bubbles: true}})); s.focus(); }} }}
+        }}
+        function onMSelChange(key, cb) {{
+            const set = MS[key].getSet();
+            if (cb.hasAttribute('data-all')) set.clear(); else if (cb.checked) set.add(cb.value); else set.delete(cb.value);
+            if (key === 'month') {{                         // weeks and days must still belong to the chosen months
+                FILT.dayFrom = FILT.dayTo = null; CAL.rangeStart = null;
+                if (FILT.months.size) FILT.weeks.forEach(w => {{ if (![...(WEEK_MONTHS[w] || [])].some(x => FILT.months.has(x))) FILT.weeks.delete(w); }});
+                renderPanel('week');
+            }} else if (key === 'week') {{ FILT.dayFrom = FILT.dayTo = null; CAL.rangeStart = null; }}
+            refreshAll();
+            scheduleUpdate();
+        }}
+        function scheduleUpdate() {{ clearTimeout(updateTimer); updateTimer = setTimeout(updateDashboard, 60); }}
+        function refreshAll() {{ syncWeekOptions(); Object.keys(MS).forEach(refreshMSel); document.getElementById('calBtn').textContent = calText(); document.getElementById('calBtn').title = calText(); if (document.getElementById('calBox').classList.contains('open')) renderCal(); }}
+
+        // ---------- calendar ----------
+        function calText() {{
+            const sameYear = (a, b) => a.slice(0, 4) === b.slice(0, 4);
+            if (FILT.dayFrom !== null) return FILT.dayFrom === FILT.dayTo ? fmtDay(FILT.dayFrom, true) : fmtDay(FILT.dayFrom, !sameYear(FILT.dayFrom, FILT.dayTo)) + ' - ' + fmtDay(FILT.dayTo, true);
+            if (FILT.weeks.size === 1) return 'Week ' + weekLabel([...FILT.weeks][0]);
+            if (FILT.weeks.size > 1) return FILT.weeks.size + ' weeks';
+            if (FILT.months.size === 1) return [...FILT.months][0];
+            if (FILT.months.size > 1) return FILT.months.size + ' months';
+            return 'All dates';
+        }}
+        function calGoToSelection() {{
+            let label = FILT.months.size ? sortedMonths(FILT.months).pop() : MONTH_ORDER[MONTH_ORDER.length - 1];
+            if (FILT.dayFrom !== null) label = DATE_MONTH[FILT.dayFrom] || label;
+            const p = (label || '').split(' ');
+            const mi = MON3.indexOf(p[0]);
+            if (mi >= 0) {{ CAL.month = mi; CAL.year = parseInt(p[1], 10); }}
+        }}
+        function renderCal() {{
+            const panel = document.getElementById('calPanel');
+            let h = '<div class="cal-tabs">' + ['day', 'week', 'month'].map(t => '<div class="cal-tab' + (CAL.mode === t ? ' active' : '') + '" data-mode="' + t + '">' + t.charAt(0).toUpperCase() + t.slice(1) + '</div>').join('') + '</div>';
+            if (CAL.view === 'months') {{
+                h += '<div class="cal-head"><div class="cal-nav" data-nav="-12">&lsaquo;</div><div class="cal-title" data-title="1">' + CAL.year + '</div><div class="cal-nav" data-nav="12">&rsaquo;</div></div><div class="cal-months">';
+                for (let m = 0; m < 12; m++) {{
+                    const lab = MON3[m] + ' ' + CAL.year, ok = MONTH_ORDER.indexOf(lab) >= 0;
+                    h += '<div class="cal-m' + (ok ? '' : ' nodata') + (ok && FILT.months.has(lab) && FILT.weeks.size === 0 && FILT.dayFrom === null ? ' sel' : '') + '" data-m="' + m + '">' + MON3[m] + '</div>';
+                }}
+                h += '</div>';
+            }} else {{
+                h += '<div class="cal-head"><div class="cal-nav" data-nav="-1">&lsaquo;</div><div class="cal-title" data-title="1">' + MON3[CAL.month] + ' ' + CAL.year + ' &#9662;</div><div class="cal-nav" data-nav="1">&rsaquo;</div></div>';
+                h += '<div class="cal-grid' + (CAL.mode === 'week' ? ' weekmode' : '') + '"><div class="cal-row">' + ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'].map(x => '<div class="cal-dow">' + x + '</div>').join('') + '</div>';
+                const first = utcDate(CAL.year, CAL.month, 1), lead = (first.getUTCDay() + 6) % 7, start = new Date(first);
+                start.setUTCDate(1 - lead);
+                for (let w = 0; w < 6; w++) {{
+                    const rs = new Date(start); rs.setUTCDate(start.getUTCDate() + w * 7);
+                    const wsKey = ymd(rs.getUTCFullYear(), rs.getUTCMonth(), rs.getUTCDate());
+                    let cells = '';
+                    for (let d = 0; d < 7; d++) {{
+                        const dt = new Date(rs); dt.setUTCDate(rs.getUTCDate() + d);
+                        const ds = ymd(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate());
+                        const sel = FILT.dayFrom !== null && ds >= FILT.dayFrom && ds <= FILT.dayTo;
+                        cells += '<div class="cal-day' + (dt.getUTCMonth() !== CAL.month ? ' out' : '') + (hasDataDay(ds) ? ' hasdata' : ' nodata') + (sel ? ' sel' : '') + '" data-d="' + ds + '">' + dt.getUTCDate() + '</div>';
+                    }}
+                    h += '<div class="cal-row' + (WEEK_INFO[wsKey] !== undefined ? ' hasdata' : '') + (FILT.weeks.has(wsKey) ? ' wsel' : '') + '">' + cells + '</div>';
+                }}
+                h += '</div>';
+                if (CAL.mode === 'day') h += '<div class="cal-hint">' + (CAL.rangeStart ? 'Now click a second day to make a range.' : 'Click a day. Click a second day to make a range.') + '</div>';
+                if (CAL.mode === 'week') h += '<div class="cal-hint">Click any day to pick its whole week (Mon-Sun).</div>';
+            }}
+            h += '<div class="cal-foot"><span class="cal-btn" data-act="clear">Clear days / weeks</span><span class="cal-btn" data-act="latest">Latest month</span></div>';
+            panel.innerHTML = h;
+        }}
+        function setDayRange(a, b) {{
+            FILT.dayFrom = a; FILT.dayTo = b; FILT.weeks = new Set();
+            FILT.months = new Set(Object.keys(DATE_MONTH).filter(d => d >= a && d <= b).map(d => DATE_MONTH[d]));
+        }}
+        function afterCalChange() {{ renderPanel('week'); refreshAll(); scheduleUpdate(); }}
+        function onCalClick(e) {{
+            e.stopPropagation();
+            const t = e.target.closest('[data-mode],[data-nav],[data-title],[data-m],[data-d],[data-act]');
+            if (!t) return;
+            if (t.dataset.mode) {{ CAL.mode = t.dataset.mode; CAL.rangeStart = null; CAL.view = CAL.mode === 'month' ? 'months' : 'days'; calGoToSelection(); renderCal(); return; }}
+            if (t.dataset.nav) {{
+                const n = parseInt(t.dataset.nav, 10);
+                if (CAL.view === 'months') CAL.year += n / 12;
+                else {{ CAL.month += n; if (CAL.month < 0) {{ CAL.month = 11; CAL.year--; }} if (CAL.month > 11) {{ CAL.month = 0; CAL.year++; }} }}
+                renderCal(); return;
+            }}
+            if (t.dataset.title) {{ CAL.view = CAL.view === 'days' ? 'months' : 'days'; renderCal(); return; }}
+            if (t.dataset.m !== undefined) {{
+                const m = parseInt(t.dataset.m, 10), lab = MON3[m] + ' ' + CAL.year;
+                if (MONTH_ORDER.indexOf(lab) < 0) return;
+                if (CAL.mode === 'month') {{
+                    if (e.ctrlKey || e.metaKey || e.shiftKey) {{ if (FILT.months.has(lab)) FILT.months.delete(lab); else FILT.months.add(lab); }}
+                    else FILT.months = new Set([lab]);
+                    FILT.weeks = new Set(); FILT.dayFrom = FILT.dayTo = null;
+                    afterCalChange();
+                }} else {{ CAL.view = 'days'; CAL.month = m; renderCal(); }}
+                return;
+            }}
+            if (t.dataset.d) {{
+                const d = t.dataset.d;
+                if (CAL.mode === 'week') {{
+                    const ws = weekStartOf(d);
+                    if (WEEK_INFO[ws] === undefined) return;
+                    FILT.weeks = new Set([ws]); FILT.months = new Set(WEEK_MONTHS[ws]); FILT.dayFrom = FILT.dayTo = null;
+                }} else {{
+                    if (!hasDataDay(d)) return;
+                    if (CAL.rangeStart === null) {{ CAL.rangeStart = d; setDayRange(d, d); }}
+                    else {{ const a = CAL.rangeStart <= d ? CAL.rangeStart : d, b = CAL.rangeStart <= d ? d : CAL.rangeStart; CAL.rangeStart = null; setDayRange(a, b); }}
+                }}
+                afterCalChange(); return;
+            }}
+            if (t.dataset.act === 'clear') {{ FILT.weeks = new Set(); FILT.dayFrom = FILT.dayTo = null; CAL.rangeStart = null; afterCalChange(); }}
+            if (t.dataset.act === 'latest') {{ FILT.months = defaultMonth !== 'All' ? new Set([defaultMonth]) : new Set(); FILT.weeks = new Set(); FILT.dayFrom = FILT.dayTo = null; CAL.rangeStart = null; calGoToSelection(); afterCalChange(); }}
+        }}
+
+        function initFilters() {{
+            const monthMin = {{}};
+            rawData.forEach(r => {{
+                if (!(r.Month in monthMin) || r.Date < monthMin[r.Month]) monthMin[r.Month] = r.Date;
+                if (!WEEK_INFO[r.Week_Start]) WEEK_INFO[r.Week_Start] = r.Week_Range;
+                (WEEKS_BY_MONTH[r.Month] = WEEKS_BY_MONTH[r.Month] || new Set()).add(r.Week_Start);
+                (WEEK_MONTHS[r.Week_Start] = WEEK_MONTHS[r.Week_Start] || new Set()).add(r.Month);
+                DATE_MONTH[r.Date] = r.Month;
+            }});
+            MONTH_ORDER = Object.keys(monthMin).sort((a, b) => monthMin[a] < monthMin[b] ? -1 : 1);     // chronological, not alphabetical
+            MULTI_YEAR = new Set(Object.keys(WEEK_INFO).map(w => w.slice(0, 4))).size > 1;
+            const alpha = (a, b) => String(a).localeCompare(String(b));
+            const types = [...new Set(rawData.map(d => d.Sales_Doc_Type))].sort(alpha);
+            const branches = [...new Set(rawData.map(d => d.Branch))].sort(alpha);
+            buildMSel('month', 'mselMonth', 'All Months', () => MONTH_ORDER.map(m => ({{value: m, label: m}})), () => FILT.months, false);
+            buildMSel('week', 'mselWeek', 'All Weeks', weekOptions, () => FILT.weeks, false);
+            buildMSel('type', 'mselType', 'All Types', () => types.map(t => ({{value: t, label: t}})), () => FILT.types, types.length > 8);
+            buildMSel('branch', 'mselBranch', 'All Branches', () => branches.map(b => ({{value: b, label: b}})), () => FILT.branches, branches.length > 8);
+            Object.keys(MS).forEach(renderPanel);
+            const calBox = document.getElementById('calBox');
+            document.getElementById('calBtn').addEventListener('click', function(e) {{
+                e.stopPropagation();
+                const was = calBox.classList.contains('open');
+                closePanels(was ? null : 'cal');
+                calBox.classList.toggle('open', !was);
+                if (!was) {{ CAL.rangeStart = null; CAL.view = CAL.mode === 'month' ? 'months' : 'days'; calGoToSelection(); renderCal(); }}
+            }});
+            document.getElementById('calPanel').addEventListener('click', onCalClick);
+            document.addEventListener('click', function() {{ closePanels(null); }});
+            document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape') closePanels(null); }});
+            refreshAll();
+        }}
+
+        // set every filter at once (used by Reset, by the calendar and by tests)
+        function setFilters(st) {{
+            st = st || {{}};
+            FILT.months = new Set(st.months || []); FILT.weeks = new Set(st.weeks || []);
+            FILT.types = new Set(st.types || []); FILT.branches = new Set(st.branches || []);
+            FILT.dayFrom = st.dayFrom || null; FILT.dayTo = st.dayTo || st.dayFrom || null;
+            document.getElementById('filterSearch').value = st.search || '';
+            CAL.rangeStart = null;
+            if (MS.week) {{ renderPanel('week'); refreshAll(); }}
             updateDashboard();
         }}
+        function getFilters() {{
+            return {{months: sortedMonths(FILT.months), weeks: [...FILT.weeks].sort(), types: [...FILT.types].sort(), branches: [...FILT.branches].sort(), dayFrom: FILT.dayFrom, dayTo: FILT.dayTo, search: FILT.search}};
+        }}
+        function resetFilters() {{ setFilters({{months: defaultMonth !== 'All' ? [defaultMonth] : []}}); }}
 
         function updateDashboard() {{
-            const fMonth = document.getElementById('filterMonth').value;
-            const fType = document.getElementById('filterType').value;
-            const fBranch = document.getElementById('filterBranch').value;
-            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            syncSearch();
 
             // JS Instant Filter with strict String safety for searches
             // Automatically excludes Missed_Qty <= 0 for KPI accuracy
             const filtered = rawData.filter(r => {{
                 if (r.Missed_Qty <= 0) return false;
-                if (fMonth !== 'All' && r.Month !== fMonth) return false;
-                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
-                if (fBranch !== 'All' && r.Branch !== fBranch) return false;
-                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
-                return true;
+                return matchRow(r);
             }});
 
             let totalVal = 0, ordQty = 0, delQty = 0, missQty = 0, missedLines = 0, totalLines = 0;
@@ -834,13 +1167,7 @@ html_template = f"""
             const weekLabels = {{}};
             
             // Re-calculate totals using ALL data (including Missed_Qty=0) so the KPIs are accurate
-            const rawFiltered = rawData.filter(r => {{
-                if (fMonth !== 'All' && r.Month !== fMonth) return false;
-                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
-                if (fBranch !== 'All' && r.Branch !== fBranch) return false;
-                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
-                return true;
-            }});
+            const rawFiltered = rawData.filter(r => matchRow(r));
 
             rawFiltered.forEach(r => {{
                 totalVal += r.Lost_Value || 0;
@@ -943,10 +1270,10 @@ html_template = f"""
         // ADDED: value-perspective cards, made-vs-missed charts, branch/month/large-order tables and extra insights.
         // Runs after the original updateDashboard() and only reads rawData/largeData, so the original visuals are never altered.
         function updateExtras() {{
-            const fMonth = document.getElementById('filterMonth').value;
-            const fType = document.getElementById('filterType').value;
-            const fBranch = document.getElementById('filterBranch').value;
-            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            syncSearch();
+            if (FILT.months.size === 1 || FILT.weeks.size > 0 || FILT.dayFrom !== null) {{        // "Peak Month" only makes sense when several months are compared
+                Array.from(document.getElementById('dynamicInsights').children).forEach(li => {{ if (li.innerText.indexOf('Peak Month Analysis') !== -1) li.remove(); }});
+            }}
             const hasV = ordValReady;
             const MADE_C = '#34d399', MISS_C = '#f48a6a', PURPLE_C = '#5a5ce0';
             const NA = '\u2014';
@@ -954,15 +1281,9 @@ html_template = f"""
             const pctOf = (a, b) => b > 0 ? (a / b) * 100 : null;
             const pctTxt = (x) => x === null ? NA : x.toFixed(1) + '%';
 
-            const pass = (r, useBranch) => {{
-                if (fMonth !== 'All' && r.Month !== fMonth) return false;
-                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
-                if (useBranch && fBranch !== 'All' && r.Branch !== fBranch) return false;
-                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
-                return true;
-            }};
+            const pass = (r, useBranch) => matchRow(r, useBranch ? {{}} : {{branch: true}});
             const rows = rawData.filter(r => pass(r, true));
-            const baseRows = fBranch === 'All' ? rows : rawData.filter(r => pass(r, false));
+            const baseRows = FILT.branches.size === 0 ? rows : rawData.filter(r => pass(r, false));
             const blank = () => ({{ordQty: 0, missQty: 0, ordVal: 0, missVal: 0, items: 0, short: 0}});
             const add = (a, r) => {{ a.ordQty += r.Order_Qty || 0; a.missQty += r.Missed_Qty || 0; a.ordVal += r.Ordered_Value || 0; a.missVal += r.Lost_Value || 0; a.items += r.Total_Lines || 1; a.short += r.Missed_Lines || 0; return a; }};
             const T = rows.reduce(add, blank());
@@ -1026,8 +1347,9 @@ html_template = f"""
             tableBranchPerf.clear().rows.add(branchRows).draw();
 
             // ---- Month aggregation (chronological)
+            const monthRows = rawData.filter(r => matchRow(r, {{month: true, week: true, day: true}}));
             const mo = {{}};
-            rows.forEach(r => {{
+            monthRows.forEach(r => {{
                 const key = String(r.Date || '').slice(0, 7) || r.Month;
                 if (!mo[key]) mo[key] = Object.assign(blank(), {{label: r.Month}});
                 add(mo[key], r);
@@ -1124,9 +1446,7 @@ html_template = f"""
         }}
 
         function openDrill(branch, ev) {{
-            const fMonth = document.getElementById('filterMonth').value;
-            const fType = document.getElementById('filterType').value;
-            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            syncSearch();
             const hasV = ordValReady;
             const NA = '\u2014';
             const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
@@ -1136,12 +1456,7 @@ html_template = f"""
             const shorten = (s) => s.length > 34 ? s.slice(0, 33) + '\u2026' : s;
             const MADE_C = '#34d399', MISS_C = '#f48a6a';
 
-            const base = rawData.filter(r => {{
-                if (fMonth !== 'All' && r.Month !== fMonth) return false;
-                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
-                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
-                return true;
-            }});
+            const base = rawData.filter(r => matchRow(r, {{branch: true}}));
             const mine = base.filter(r => r.Branch === branch);
             const blank = () => ({{ordQty: 0, missQty: 0, ordVal: 0, missVal: 0, items: 0, short: 0}});
             const add = (a, r) => {{ a.ordQty += r.Order_Qty || 0; a.missQty += r.Missed_Qty || 0; a.ordVal += r.Ordered_Value || 0; a.missVal += r.Lost_Value || 0; a.items += r.Total_Lines || 1; a.short += r.Missed_Lines || 0; return a; }};
@@ -1155,7 +1470,7 @@ html_template = f"""
             const rank = ranked.indexOf(branch) + 1;
 
             const mo = {{}};
-            mine.forEach(r => {{ const k = String(r.Date || '').slice(0, 7) || r.Month; if (!mo[k]) mo[k] = Object.assign(blank(), {{label: r.Month}}); add(mo[k], r); }});
+            rawData.filter(r => r.Branch === branch && matchRow(r, {{month: true, week: true, day: true, branch: true}})).forEach(r => {{ const k = String(r.Date || '').slice(0, 7) || r.Month; if (!mo[k]) mo[k] = Object.assign(blank(), {{label: r.Month}}); add(mo[k], r); }});
             const mk = Object.keys(mo).sort();
 
             const pr = {{}};
@@ -1167,8 +1482,7 @@ html_template = f"""
             }});
             const prods = Object.keys(pr).sort((a, b) => pr[b].lost - pr[a].lost);
 
-            const lg = largeData.filter(r => r.Branch === branch && (fMonth === 'All' || r.Month === fMonth) && (fType === 'All' || r.Sales_Doc_Type === fType)
-                && (!fSearch || String(r.Product_Desc || "").toLowerCase().includes(fSearch))).sort((a, b) => b.Lost_Value - a.Lost_Value);
+            const lg = largeData.filter(r => r.Branch === branch && matchRow(r, {{branch: true}})).sort((a, b) => b.Lost_Value - a.Lost_Value);
 
             const tile = (label, value, cls) => '<div class="drill-tile"><div class="t-label">' + label + '</div><div class="t-value ' + (cls || '') + '">' + value + '</div></div>';
             let html = '<div class="drill-tiles">' +
@@ -1201,7 +1515,7 @@ html_template = f"""
             }}
 
             document.getElementById('drillTitle').textContent = branch + ' \u2014 branch drill-down';
-            document.getElementById('drillSub').textContent = 'Filters applied \u2014 Month: ' + (fMonth === 'All' ? 'All months' : fMonth) + '  |  Doc type: ' + (fType === 'All' ? 'All types' : fType) + (fSearch ? '  |  Product search: "' + fSearch + '"' : '');
+            document.getElementById('drillSub').textContent = describeFilters(false);
             document.getElementById('drillBody').innerHTML = html;
             const overlay = document.getElementById('drillOverlay'), box = document.getElementById('drillBox');
             const docH = document.documentElement.scrollHeight;
@@ -1238,23 +1552,14 @@ html_template = f"""
         }}
 
         function openLargeDrill(ev) {{
-            const fMonth = document.getElementById('filterMonth').value;
-            const fType = document.getElementById('filterType').value;
-            const fBranch = document.getElementById('filterBranch').value;
-            const fSearch = document.getElementById('filterSearch').value.toLowerCase();
+            syncSearch();
             const NA = '\u2014';
             const fmtInt = (n) => Number(n || 0).toLocaleString('en-US', {{maximumFractionDigits: 0}});
             const pctOf = (a, b) => b > 0 ? (a / b) * 100 : null;
             const pctTxt = (x) => x === null ? NA : x.toFixed(1) + '%';
             const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const MISS_C = '#f48a6a', PURPLE_C = '#5a5ce0';
-            const pass = (r) => {{
-                if (fMonth !== 'All' && r.Month !== fMonth) return false;
-                if (fType !== 'All' && r.Sales_Doc_Type !== fType) return false;
-                if (fBranch !== 'All' && r.Branch !== fBranch) return false;
-                if (fSearch && !String(r.Product_Desc || "").toLowerCase().includes(fSearch)) return false;
-                return true;
-            }};
+            const pass = (r) => matchRow(r);
             const totMiss = rawData.filter(pass).reduce((a, r) => a + (r.Lost_Value || 0), 0);
             const lg = largeData.filter(pass).sort((a, b) => b.Lost_Value - a.Lost_Value);
             const lgSum = lg.reduce((a, r) => a + (r.Lost_Value || 0), 0);
@@ -1262,6 +1567,8 @@ html_template = f"""
             const byBranch = {{}}, byMonth = {{}};
             lg.forEach(r => {{
                 byBranch[r.Branch] = (byBranch[r.Branch] || 0) + (r.Lost_Value || 0);
+            }});
+            largeData.filter(r => matchRow(r, {{month: true, week: true, day: true}})).forEach(r => {{
                 const k = String(r.Date || '').slice(0, 7) || r.Month;
                 if (!byMonth[k]) byMonth[k] = {{label: r.Month, v: 0}};
                 byMonth[k].v += r.Lost_Value || 0;
@@ -1296,7 +1603,7 @@ html_template = f"""
                     '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
             }}
             document.getElementById('drillTitle').textContent = 'Large orders \u2014 ' + thr + '+ missed per item';
-            document.getElementById('drillSub').textContent = 'Filters applied \u2014 Month: ' + (fMonth === 'All' ? 'All months' : fMonth) + '  |  Doc type: ' + (fType === 'All' ? 'All types' : fType) + '  |  Branch: ' + (fBranch === 'All' ? 'All branches' : fBranch) + (fSearch ? '  |  Product search: "' + fSearch + '"' : '');
+            document.getElementById('drillSub').textContent = describeFilters(true);
             document.getElementById('drillBody').innerHTML = html;
             const overlay = document.getElementById('drillOverlay'), box = document.getElementById('drillBox');
             const docH = document.documentElement.scrollHeight;
@@ -1328,12 +1635,13 @@ components.html(html_template, height=4300, scrolling=True)
 # 5. BOTTOM ADMIN PANEL
 # ---------------------------------------------------------------------
 st.markdown("<div class='admin-section'>", unsafe_allow_html=True)
+database.load_env_file()      # optional .env file next to app.py (for your own computer); real environment variables always win
 
 if not st.session_state.logged_in:
     with st.expander("⚙️ Data Management & Settings (Admin Only)"):
         pwd = st.text_input("Admin Password", type="password", placeholder="Enter password...")
         if st.button("Login"):
-            if pwd == "admin123":
+            if pwd == os.environ.get("ADMIN_PASSWORD", "admin123"):
                 st.session_state.logged_in = True
                 st.rerun()
             else:
@@ -1358,6 +1666,99 @@ else:
             database.upload_sales(sales_file)
             st.cache_data.clear()
             st.success("✅ Sales Saved! Click Refresh below.")
+    
+
+    # ---- Sync from the RMS Data Warehouse API (added) ----
+    st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
+    st.markdown("<h4 style='margin: 0 0 4px 0; color: #1e293b; font-family: Inter;'>Sync from RMS Data Warehouse (API)</h4>", unsafe_allow_html=True)
+    _api = database.api_status()
+    if not _api['configured']:
+        st.warning("The API login is not set up yet. On Railway: open the Variables tab and add RMS_API_USER and RMS_API_PASSWORD. On your own computer: create a file named .env next to app.py with those two lines. Never put them in the code.")
+    else:
+        _last = database.last_sync()
+        st.caption(f"Source: {_api['base']}  |  Login: {_api['user']} (from {_api['source']})  |  " + (f"Last sync: {_last}" if _last else "No sync yet"))
+        # Normal use: refresh from the start of the latest month. If some older rows still have no order value, default to the
+        # earliest date so ONE sync fills them all (the value cards need every row to have it).
+        try:
+            _from_default = pd.to_datetime(db_stats['max_date' if ORDVAL_READY else 'min_date']).date().replace(day=1)
+        except Exception:
+            _from_default = (date.today().replace(day=1) - timedelta(days=62)).replace(day=1)
+        if not ORDVAL_READY and db_stats['rows']:
+            st.info(f"Some older rows still have no order value, so the value cards show a dash. Run ONE sync that starts at {_from_default} (already filled in below) to fill them all.")
+        _c1, _c2 = st.columns(2)
+        _d_from = _c1.date_input("From", value=_from_default, key="api_from")
+        _d_to = _c2.date_input("To", value=date.today(), key="api_to")
+        _b1, _b2, _b3 = st.columns(3)
+        _go_test = _b1.button("🔌 Test connection")
+        _go_preview = _b2.button("🔍 Preview (no changes)", help="Reads the API and compares it with the database. Nothing is saved.")
+        _go_sync = _b3.button("⬇️ Sync from API", help="Saves the API data. Lines already in the database are updated, never duplicated.")
+        if _go_test:
+            with st.spinner("Contacting the API..."):
+                st.session_state.api_out = {'kind': 'test', 'steps': database.api_test()}
+        if _go_preview or _go_sync:
+            _bar = st.progress(0.0, text="Starting...")
+            def _cb(i, n, msg):
+                _bar.progress(min(i / max(n, 1), 1.0), text=msg)
+            try:
+                _res = database.api_run(_d_from, _d_to, apply=_go_sync, progress=_cb)
+                st.session_state.api_out = {'kind': 'sync' if _go_sync else 'preview', 'res': _res}
+            except database.ApiError as _e:
+                st.session_state.api_out = {'kind': 'error', 'msg': str(_e)}
+            except Exception as _e:
+                st.session_state.api_out = {'kind': 'error', 'msg': f"Unexpected problem: {type(_e).__name__}"}
+            _bar.empty()
+            if _go_sync:
+                st.cache_data.clear()
+                st.rerun()
+        _out = st.session_state.get('api_out')
+        if _out:
+            if _out['kind'] == 'error':
+                st.error(_out['msg'])
+            elif _out['kind'] == 'test':
+                for _label, _ok, _detail in _out['steps']:
+                    (st.success if _ok else st.error)(f"{_label}: {_detail}")
+            else:
+                _r = _out['res']
+                _m = _r['months']
+                _n = lambda v: f"{v:,.0f}"
+                if _r['error']:
+                    st.error(f"Stopped at {_r['error']}  (months before it were " + ("saved)" if _r['applied'] else "read only)"))
+                if _m:
+                    _tot = lambda k: sum(x[k] for x in _m)
+                    if _r['applied']:
+                        st.success(f"Synced {_n(_tot('api_lines'))} lines ({_n(_tot('inserted'))} new, {_n(_tot('updated'))} updated) for {_r['from']} to {_r['to']}.")
+                    else:
+                        st.info(f"PREVIEW, nothing was saved. API: {_n(_tot('api_lines'))} lines | database (same dates): {_n(_tot('db_lines'))} | already in database: {_n(_tot('matched'))} | new: {_n(_tot('new_in_api'))} | only in database: {_n(_tot('only_in_db'))} | confirmed qty differs on {_n(_tot('confirmed_differs'))} lines.")
+                    _vals = _r.get('doctype_values') or []
+                    _vtxt = (f" ({len(_vals)} values: " + ", ".join(_vals[:8]) + (" ..." if len(_vals) > 8 else "") + ")") if _vals else ""
+                    st.caption(f"Document type taken from: {_r['doctype_source']}{_vtxt}  |  Confirmed quantity taken from API field: {_r['confirmed_field']}")
+                    st.dataframe(pd.DataFrame([{
+                        'Month': x['month'], 'API lines': _n(x['api_lines']), 'DB lines': _n(x['db_lines']), 'In both': _n(x['matched']),
+                        'New in API': _n(x['new_in_api']), 'Only in DB': _n(x['only_in_db']), 'Confirmed qty differs': _n(x['confirmed_differs']),
+                        'Missed qty (API)': _n(x['api_missed_qty']), 'Missed qty (DB)': _n(x['db_missed_qty']),
+                        'Missed value (API)': _n(x['api_missed_value']), 'Missed value (DB)': _n(x['db_missed_value'])} for x in _m]), hide_index=True)
+                for _w in _r['warnings']:
+                    st.warning(_w)
+
+    # ---- Automatic sync switch and status (added) ----
+    if _api['configured']:
+        _sch = database.scheduler_status()
+        st.markdown("<hr style='margin:10px 0;'>", unsafe_allow_html=True)
+        st.markdown("<h4 style='margin: 0 0 4px 0; color: #1e293b; font-family: Inter;'>Automatic sync</h4>", unsafe_allow_html=True)
+        _hours = " and ".join(f"{h:02d}:00" for h in _sch['hours'])
+        _box = st.checkbox(f"Run the API sync automatically every day at {_hours} (Rwanda time)", value=_sch['enabled'], disabled=_sch['forced'], key="auto_sync_box",
+                           help="Tick this only after the Preview looks right. It re-reads the recent months from the API twice a day and updates the database.")
+        if not _sch['forced'] and _box != _sch['enabled']:
+            database.set_setting('auto_sync', 'on' if _box else 'off')
+            st.rerun()
+        if _sch['forced']:
+            st.caption("This is set by the RMS_AUTO_SYNC variable, so the switch is locked.")
+        if _sch['enabled']:
+            st.caption(f"Next automatic run: {_sch['next_run']} (Kigali time)  |  Last automatic run: {_sch['last_auto'] or 'none yet'}")
+            if not _sch['always_on']:
+                st.caption("Timer note: it runs while the app is running. Start the app with  python run.py  (Railway start command) so it also runs when nobody has the page open; otherwise a missed run is caught up at the next visit.")
+        else:
+            st.caption("Automatic sync is OFF.")
     
     if st.button("🔄 Refresh Dashboard Data"):
         st.rerun()
