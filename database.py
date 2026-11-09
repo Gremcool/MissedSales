@@ -33,6 +33,17 @@ def init_db():
             "Missed_Qty" REAL,
             "Lost_Value" REAL,
             "Ordered_Value" REAL,
+            "Customer Code" TEXT,
+            "Customer Name" TEXT,
+            "Order Status" TEXT,
+            "Currency" TEXT,
+            "UoM" TEXT,
+            "NPC Code" TEXT,
+            "Batch" TEXT,
+            "Program" TEXT,
+            "Qty Remaining" REAL,
+            "Unit Price" REAL,
+            "Line Value" REAL,
             UNIQUE("Sales Document", "Sales Document Item")
         )
     ''')
@@ -41,6 +52,11 @@ def init_db():
     existing_cols = [r[1] for r in conn.execute('PRAGMA table_info(sales)').fetchall()]
     if 'Ordered_Value' not in existing_cols:
         conn.execute('ALTER TABLE sales ADD COLUMN "Ordered_Value" REAL')
+    # Migration: customer (health facility) code and name, filled by the API sync (older rows stay empty until they are re-synced)
+    for col, typ in (('Customer Code', 'TEXT'), ('Customer Name', 'TEXT'), ('Order Status', 'TEXT'), ('Currency', 'TEXT'), ('UoM', 'TEXT'), ('NPC Code', 'TEXT'),
+                     ('Batch', 'TEXT'), ('Program', 'TEXT'), ('Qty Remaining', 'REAL'), ('Unit Price', 'REAL'), ('Line Value', 'REAL')):
+        if col not in existing_cols:
+            conn.execute('ALTER TABLE sales ADD COLUMN "%s" %s' % (col, typ))
     conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON sales("Document Date")')
     conn.commit()
     conn.close()
@@ -160,6 +176,7 @@ def upload_sales(file_buffer):
     conn.execute("DROP TABLE temp_sales")
     conn.commit()
     conn.close()
+    touch_data()
 
 
 # ---------------------------------------------------------------------
@@ -168,6 +185,7 @@ def upload_sales(file_buffer):
 # upload produces, and UPSERTS it (the API is the source of truth for the dates it covers).
 # Login details come ONLY from environment variables (Railway "Variables"), never from the code.
 # ---------------------------------------------------------------------
+import re
 import time
 import threading
 from datetime import date, datetime, timedelta, timezone
@@ -180,7 +198,21 @@ class ApiError(Exception):
 DOC_PREFIX_TYPES = {'41': 'ZRMS', '61': 'ZSPO'}   # observed in the data: 41xxxxxxxx = ZRMS, 61xxxxxxxx = ZSPO
 ALLOWED_DOC_TYPES = {'ZRMS', 'ZSPO'}
 API_DB_COLS = ['Sales Document', 'Sales Document Item', 'Document Date', 'Sales Document Type', 'Plant',
-               'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value', 'Ordered_Value']
+               'Material Description', 'Order_Qty', 'Confirmed_Qty', 'Missed_Qty', 'Lost_Value', 'Ordered_Value',
+               'Customer Code', 'Customer Name']
+
+
+# Other fields of the API export that the dashboard does not use directly but that are kept in the database (api column, database column, type).
+# Any column that is not listed anywhere is saved too, as API_<name>, so nothing the API provides is lost.
+API_EXTRA_KNOWN = [('status', 'Order Status', 'TEXT'), ('currency', 'Currency', 'TEXT'), ('uom', 'UoM', 'TEXT'), ('npc_code', 'NPC Code', 'TEXT'), ('batch', 'Batch', 'TEXT'),
+                   ('program', 'Program', 'TEXT'), ('qty_remaining', 'Qty Remaining', 'REAL'), ('unit_price', 'Unit Price', 'REAL'), ('line_value', 'Line Value', 'REAL')]
+
+
+def _ensure_columns(conn, table, wanted):
+    have = {r[1] for r in conn.execute('PRAGMA table_info("%s")' % table).fetchall()}
+    for name, typ in wanted:
+        if name not in have:
+            conn.execute('ALTER TABLE "%s" ADD COLUMN "%s" %s' % (table, name, typ or 'TEXT'))
 
 
 _ENV_LOADED = {}      # settings currently taken from a .env file (key -> value)
@@ -356,6 +388,13 @@ def _map_api_chunk(df, cfg, state):
     out['Missed_Qty'] = (q_ord - q_conf).clip(lower=0)
     out['Lost_Value'] = out['Missed_Qty'] * price
     out['Ordered_Value'] = q_ord * price
+    # Customer = the health facility that ordered (optional columns: an older API without them still works)
+    for src, dst in (('customer_code', 'Customer Code'), ('customer_name', 'Customer Name')):
+        if src in cols:
+            s = text(src).str.replace(r'\.0$', '', regex=True) if src == 'customer_code' else text(src)
+            out[dst] = s.mask(s == '')
+        else:
+            out[dst] = pd.Series([None] * len(out), index=out.index, dtype='object')
 
     # Document type. DEFAULT: whatever the API gives in 'program', exactly as it is (a blank becomes "Unknown").
     # Optional modes (RMS_API_DOCTYPE_FIELD=auto|prefix) keep the older rule that only accepts ZRMS / ZSPO.
@@ -387,15 +426,49 @@ def _map_api_chunk(df, cfg, state):
             raise ApiError("Some lines have a document type other than ZRMS/ZSPO (source: %s). Nothing was saved." % source)
         out['Sales Document Type'] = types
 
+    # How many lines carry a facility name (reported after the sync, so a missing / empty customer_name is never silent)
+    state['cust_col'] = ('customer_name' in cols)
+    state['cust_total'] = state.get('cust_total', 0) + len(out)
+    state['cust_named'] = state.get('cust_named', 0) + int(out['Customer Name'].notna().sum())
+
+    # Everything else the API sends is kept too: status, currency, unit of measure, material code, batch, program, remaining quantity, price, line value ...
+    extra_names = []
+    for src, dst, typ in API_EXTRA_KNOWN:
+        if src in cols:
+            if typ == 'REAL':
+                out[dst] = pd.to_numeric(df[cols[src]], errors='coerce')
+            else:
+                s = text(src)
+                if src == 'status':
+                    s = s.str.lower().str.capitalize()           # open / Open / OPEN -> Open
+                out[dst] = s.mask(s == '')
+            state.setdefault('extra_saved', set()).add(dst)
+        else:
+            out[dst] = pd.Series([None] * len(out), index=out.index, dtype='object')
+        extra_names.append(dst)
+    used = {'order_no', 'line_no', 'order_date', 'plant', 'description', 'qty_ordered', 'qty_delivered', 'customer_code', 'customer_name', conf} | {s for s, _, _ in API_EXTRA_KNOWN}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        dst = 'API_' + re.sub(r'[^0-9A-Za-z_]+', '_', str(c).strip()).strip('_')
+        if not key or key in used or dst == 'API_':
+            continue
+        s = df[c].astype('string').str.strip()
+        out[dst] = s.mask(s == '')
+        extra_names.append(dst)
+        if dst not in state.setdefault('dyn_cols', []):
+            state['dyn_cols'].append(dst)
+
     valid = out['Sales Document'].notna() & out['Sales Document Item'].notna() & dt.notna()
     skipped = int((~valid).sum())
     out = out[valid]
-    return out[API_DB_COLS], skipped
+    return out[API_DB_COLS + extra_names], skipped
 
 
 _TEMP_API_SQL = '''CREATE TABLE temp_api (
     "Sales Document" TEXT, "Sales Document Item" TEXT, "Document Date" TEXT, "Sales Document Type" TEXT, "Plant" TEXT,
-    "Material Description" TEXT, "Order_Qty" REAL, "Confirmed_Qty" REAL, "Missed_Qty" REAL, "Lost_Value" REAL, "Ordered_Value" REAL)'''
+    "Material Description" TEXT, "Order_Qty" REAL, "Confirmed_Qty" REAL, "Missed_Qty" REAL, "Lost_Value" REAL, "Ordered_Value" REAL,
+    "Customer Code" TEXT, "Customer Name" TEXT, "Order Status" TEXT, "Currency" TEXT, "UoM" TEXT, "NPC Code" TEXT, "Batch" TEXT, "Program" TEXT,
+    "Qty Remaining" REAL, "Unit Price" REAL, "Line Value" REAL)'''
 
 
 def _load_month(conn, api, d_from, d_to, state):
@@ -405,6 +478,7 @@ def _load_month(conn, api, d_from, d_to, state):
     for chunk in _iter_export(api, d_from, d_to):
         mapped, bad = _map_api_chunk(chunk, api.cfg, state)
         skipped += bad
+        _ensure_columns(conn, 'temp_api', [(c, 'TEXT') for c in mapped.columns])      # columns this version has never seen are added as text
         mapped.to_sql('temp_api', conn, if_exists='append', index=False)
     # the same order line twice in the export -> keep the last one
     conn.execute('DELETE FROM temp_api WHERE rowid NOT IN (SELECT MAX(rowid) FROM temp_api GROUP BY "Sales Document", "Sales Document Item")')
@@ -434,16 +508,65 @@ def _api_compare(conn, lo, hi):
             'new_in_api': a[0] - m[0], 'only_in_db': only_db}
 
 
-def _api_apply(conn):
-    cols = ', '.join('"%s"' % c for c in API_DB_COLS)
-    updates = ', '.join('"%s" = excluded."%s"' % (c, c) for c in API_DB_COLS if c not in ('Sales Document', 'Sales Document Item'))
+def _present_cols(state):
+    """The optional columns the API actually sent in this run (customer, status, currency ... and any unknown column)."""
+    return set(state.get('extra_saved', set())) | set(state.get('dyn_cols', [])) | ({'Customer Code', 'Customer Name'} if state.get('cust_col') else set())
+
+
+def _api_apply(conn, present=None):
+    t = [(r[1], r[2] or 'TEXT') for r in conn.execute('PRAGMA table_info(temp_api)').fetchall()]
+    always = [c for c in API_DB_COLS if c not in ('Customer Code', 'Customer Name')]
+    if present is not None:                                   # a column the API did not send this time keeps the value it already has
+        t = [(n, ty) for n, ty in t if n in always or n in present]
+    _ensure_columns(conn, 'sales', t)                         # the sales table grows to hold any new column the API sent
+    names = [n for n, _ in t]
+    cols = ', '.join('"%s"' % c for c in names)
+    updates = ', '.join('"%s" = excluded."%s"' % (c, c) for c in names if c not in ('Sales Document', 'Sales Document Item'))
     conn.execute('INSERT INTO sales (%s) SELECT %s FROM temp_api WHERE 1 ON CONFLICT("Sales Document", "Sales Document Item") DO UPDATE SET %s' % (cols, cols, updates))
+
+
+SYNC_VERSION = 2      # 2 = a sync that keeps status, currency, unit of measure ... and the facility names (used by the back-fill helper to know which ranges are really done)
 
 
 def _log_sync(conn, d_from, d_to, lines, inserted, updated, status, source='API'):
     conn.execute('CREATE TABLE IF NOT EXISTS sync_log (ts TEXT, source TEXT, from_date TEXT, to_date TEXT, lines INTEGER, inserted INTEGER, updated INTEGER, status TEXT)')
-    conn.execute('INSERT INTO sync_log VALUES (?,?,?,?,?,?,?,?)',
-                 (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), source, d_from.isoformat(), d_to.isoformat(), lines, inserted, updated, status))
+    if 'ver' not in [r[1] for r in conn.execute('PRAGMA table_info(sync_log)').fetchall()]:
+        conn.execute('ALTER TABLE sync_log ADD COLUMN ver INTEGER')
+    conn.execute('INSERT INTO sync_log (ts, source, from_date, to_date, lines, inserted, updated, status, ver) VALUES (?,?,?,?,?,?,?,?,?)',
+                 (datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), source, d_from.isoformat(), d_to.isoformat(), lines, inserted, updated, status, SYNC_VERSION))
+
+
+def backfill_plan(start, months_per_range=3, today=None):
+    """Ready-made, month-aligned ranges from `start` to today, oldest first: [{'from', 'to', 'done', 'when'}].
+    A range is done once a COMPLETE sync made by this version covered all of it (a sync made before this version did not keep the new columns)."""
+    today = today or date.today()
+    n = max(1, int(months_per_range))
+    done_rows = []
+    if os.path.exists(DB_NAME):
+        try:
+            conn = get_connection()
+            if 'ver' in [r[1] for r in conn.execute('PRAGMA table_info(sync_log)').fetchall()]:
+                done_rows = conn.execute("SELECT from_date, to_date, ts FROM sync_log WHERE status = 'complete' AND ver >= ?", (SYNC_VERSION,)).fetchall()
+            conn.close()
+        except Exception:
+            done_rows = []
+    out, cur = [], date(start.year, start.month, 1)
+    while cur <= today:
+        mm = cur.month - 1 + n
+        nxt = date(cur.year + mm // 12, mm % 12 + 1, 1)
+        end = min(nxt - timedelta(days=1), today)
+        out.append({'from': cur, 'to': end, 'done': False, 'when': None})
+        cur = nxt
+    if len(out) > 1 and out[-1]['from'].month == today.month and out[-1]['from'].year == today.year:
+        out[-2]['to'] = today                                  # the little last piece (the current month) joins the range before it
+        out.pop()
+    for p in out:
+        need = (p['to'] - timedelta(days=1)).isoformat() if p['to'] == today else p['to'].isoformat()      # a sync from yesterday still counts for the latest range
+        for f, t, ts in done_rows:
+            if f <= p['from'].isoformat() and t >= need:
+                p['done'], p['when'] = True, (ts or '')[:10]
+                break
+    return out
 
 
 def last_sync():
@@ -503,7 +626,7 @@ def _api_run_impl(d_from, d_to, apply=False, progress=None, source='API'):
                 st_['blank_plant'] = conn.execute('SELECT COUNT(*) FROM temp_api WHERE Plant IS NULL').fetchone()[0]
                 st_['confirmed_gt_ordered'] = conn.execute('SELECT COUNT(*) FROM temp_api WHERE Confirmed_Qty > Order_Qty').fetchone()[0]
                 if apply:
-                    _api_apply(conn)
+                    _api_apply(conn, _present_cols(state))
                     conn.commit()
                     st_['updated'], st_['inserted'] = st_['matched'], st_['new_in_api']
                 months.append(st_)
@@ -520,6 +643,8 @@ def _api_run_impl(d_from, d_to, apply=False, progress=None, source='API'):
             conn.commit()
     finally:
         conn.close()
+    if apply and months:
+        touch_data()                              # the dashboard rebuilds its summary on the next visit
     if progress:
         progress(len(chunks), len(chunks), 'Done')
     known = set()
@@ -540,7 +665,16 @@ def _api_run_impl(d_from, d_to, apply=False, progress=None, source='API'):
         warnings.append('Lines with no plant (shown as "Unknown Branch"): %d' % sum(m['blank_plant'] for m in months))
     if any(m['confirmed_gt_ordered'] for m in months):
         warnings.append('Lines where the confirmed/delivered quantity is above the ordered quantity: %d' % sum(m['confirmed_gt_ordered'] for m in months))
+    if state.get('cust_total'):
+        if not state.get('cust_col'):
+            warnings.append('The API export has no customer_name column, so facility names cannot be shown.')
+        elif not state.get('cust_named'):
+            warnings.append('The API sent customer_name but it was empty on every line, so no facility names were saved.')
+        elif state['cust_named'] < state['cust_total']:
+            warnings.append('Lines without a facility name: %s of %s' % (format(state['cust_total'] - state['cust_named'], ','), format(state['cust_total'], ',')))
     return {'applied': apply, 'months': months, 'error': error, 'warnings': warnings, 'from': d_from, 'to': d_to,
+            'extra_saved': sorted(state.get('extra_saved', set())), 'dyn_cols': list(state.get('dyn_cols', [])),
+            'cust_named': state.get('cust_named', 0), 'cust_total': state.get('cust_total', 0), 'cust_col': state.get('cust_col', False),
             'doctype_source': state.get('doctype_source'), 'doctype_values': sorted(state.get('doctype_values', [])), 'confirmed_field': cfg['confirmed_field']}
 
 
@@ -590,6 +724,8 @@ def api_test():
             if pcol is not None and cfg['doctype_field'] == 'program':
                 vals = got[pcol].dropna().astype(str).str.strip().value_counts().head(6).index.tolist()
                 note += ' | program values seen: %s' % (', '.join(vals) if vals else '(all blank)')
+            low = {str(c).strip().lower() for c in got.columns}
+            note += ' | customer name: %s | status: %s' % ('yes' if 'customer_name' in low else 'MISSING', 'yes' if 'status' in low else 'MISSING')
             steps.append(('Export file', True, note))
     except ApiError as e:
         steps.append(('Export file', False, str(e)))
@@ -791,9 +927,34 @@ def scheduler_status(now_utc=None):
             'last_auto': get_setting('auto_last', None)}
 
 
-def data_version():
-    """Changes whenever the database file changes, so the dashboard reloads after an automatic sync."""
+def touch_data():
+    """Call after the sales data changed (sync, upload): tells the dashboard to rebuild its summary on the next visit."""
     try:
-        return int(os.path.getmtime(DB_NAME) * 1000)
-    except OSError:
-        return 0
+        set_setting('data_stamp', repr(time.time()))
+    except Exception:
+        pass
+
+
+def data_version():
+    """What the dashboard's cached summary depends on: the data stamp (moved by every sync / upload), the number of lines and the newest line.
+    Bookkeeping writes (settings, sync history) do NOT change it - they used to, which made every visit rebuild the whole page."""
+    if not os.path.exists(DB_NAME):
+        return '0'
+    try:
+        conn = get_connection()
+        try:
+            stamp = ''
+            try:
+                r = conn.execute("SELECT value FROM app_settings WHERE key = 'data_stamp'").fetchone()
+                stamp = r[0] if r else ''
+            except sqlite3.OperationalError:
+                pass
+            n, mx = conn.execute('SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM sales').fetchone()
+        finally:
+            conn.close()
+        return '%s|%s|%s' % (stamp, n, mx)
+    except Exception:
+        try:
+            return str(int(os.path.getmtime(DB_NAME) * 1000))
+        except OSError:
+            return '0'
